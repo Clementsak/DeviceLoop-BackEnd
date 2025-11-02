@@ -1,0 +1,4 @@
+Flask>=2.2.3
+flask-cors
+python-dotenv
+authlib
