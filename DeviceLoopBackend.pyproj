@@ -18,6 +18,7 @@
     <Name>DeviceLoopBackend</Name>
     <RootNamespace>DeviceLoopBackend</RootNamespace>
     <InterpreterId>MSBuild|env1|$(MSBuildProjectFullPath)</InterpreterId>
+    <SuppressPackageInstallationPrompt>True</SuppressPackageInstallationPrompt>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -28,7 +29,10 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="DeviceLoopBackend\admin_routes.py" />
     <Compile Include="DeviceLoopBackend\auth_routes.py" />
+    <Compile Include="DeviceLoopBackend\devices_routes.py" />
+    <Compile Include="DeviceLoopBackend\guards.py" />
     <Compile Include="runserver.py" />
     <Compile Include="DeviceLoopBackend\__init__.py" />
     <Compile Include="DeviceLoopBackend\views.py" />
