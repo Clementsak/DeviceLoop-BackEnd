@@ -1,10 +1,11 @@
 # DeviceLoopBackend/admin_routes.py
 import base64, json, os
 from datetime import datetime, timezone
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, session
 from botocore.exceptions import ClientError
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
+from decimal import Decimal
 
 from .guards import require_role
 from .auth_routes import (
@@ -14,6 +15,8 @@ from .auth_routes import (
     _profile_key
 )
 
+def _table():
+    return current_app.ddb_table
 
 def _gsi1() -> str: return current_app.config.get("DDB_GSI1", "GSI1")
 def _gsi2() -> str: return current_app.config.get("DDB_GSI2", "GSI2")
@@ -311,3 +314,240 @@ def verify_decision(user_pk: str):
     # 4) TODO (later): enqueue notifications to SQS/SES
 
     return jsonify(ok=True, user_pk=user_pk, type=kind, decision=decision)
+
+@bp.get("/listing-requests")
+@require_role("admin")
+def admin_list_listing_requests():
+    """
+    List listing requests for admin review.
+
+    Query params:
+      ?status=unverified|verified|rejected|active|all (default: unverified)
+      ?limit=50
+    """
+    status = (request.args.get("status") or "unverified").strip()
+    limit = max(1, min(int(request.args.get("limit", "50")), 200))
+
+    table = _table()
+
+    fe = Attr("SK").eq("LISTING_REQUEST")
+    if status != "all":
+        fe = fe & Attr("Status").eq(status)
+
+    items: list[dict] = []
+    resp = table.scan(FilterExpression=fe, Limit=limit)
+    items.extend(resp.get("Items", []))
+
+    # If you want to support pagination later you can loop on LastEvaluatedKey.
+
+    def _num(x):
+        return float(x) if isinstance(x, Decimal) else x
+
+    def to_row(it: dict) -> dict:
+        return {
+            "listingId": it.get("PK"),
+            "sellerPk": it.get("SellerPK"),
+            "devicePk": it.get("DevicePK"),
+            "category": it.get("Category"),
+            "brand": it.get("Brand"),
+            "model": it.get("Model"),
+            "variant": it.get("Variant"),
+            "storage": it.get("Storage"),
+            "ram": it.get("RAM"),
+            "status": it.get("Status", "unverified"),
+            "initialGrade": it.get("InitialGrade"),
+            "initialMin": _num(it.get("InitialMin")),
+            "initialMax": _num(it.get("InitialMax")),
+            "finalGrade": it.get("FinalGrade"),
+            "finalMin": _num(it.get("FinalMin")),
+            "finalMax": _num(it.get("FinalMax")),
+            "reviewRound": it.get("ReviewRound"),
+            "createdAt": it.get("CreatedAt"),
+            "updatedAt": it.get("UpdatedAt"),
+        }
+
+    return jsonify(items=[to_row(it) for it in items])
+
+@bp.get("/listing-requests/<listing_id>")
+@require_role("admin")
+def admin_get_listing_detail(listing_id: str):
+    """
+    Return a single listing request with normalized fields plus Photos / Questionnaire
+    for admin review.
+    """
+    table = _table()
+    resp = table.get_item(
+        Key={"PK": listing_id, "SK": "LISTING_REQUEST"},
+        ConsistentRead=True,
+    )
+    item = resp.get("Item")
+    if not item:
+        return jsonify(error="Listing request not found."), 404
+
+    def _num(x):
+        return float(x) if isinstance(x, Decimal) else x
+
+    detail = {
+        "listingId": item.get("PK"),
+        "sellerPk": item.get("SellerPK"),
+        "devicePk": item.get("DevicePK"),
+        "category": item.get("Category"),
+        "brand": item.get("Brand"),
+        "model": item.get("Model"),
+        "variant": item.get("Variant"),
+        "storage": item.get("Storage"),
+        "ram": item.get("RAM"),
+        "status": item.get("Status", "unverified"),
+        "initialGrade": item.get("InitialGrade"),
+        "initialMin": _num(item.get("InitialMin")),
+        "initialMax": _num(item.get("InitialMax")),
+        "finalGrade": item.get("FinalGrade"),
+        "finalMin": _num(item.get("FinalMin")),
+        "finalMax": _num(item.get("FinalMax")),
+        "reviewRound": item.get("ReviewRound"),
+        "createdAt": item.get("CreatedAt"),
+        "updatedAt": item.get("UpdatedAt"),
+
+        # raw extras used only in the detail view
+        "Photos": item.get("Photos") or {},
+        "Questionnaire": item.get("Questionnaire") or {},
+        "ReviewReason": item.get("ReviewReason"),
+    }
+
+    return jsonify(detail)
+
+@bp.post("/listing-requests/<listing_id>/decision")
+@require_role("admin")
+def admin_decide_listing(listing_id: str):
+    """
+    Body:
+    Approve:
+      {
+        "decision": "approve",
+        "finalGrade": "A" | "B" | "C",
+        "reason": "optional notes"
+      }
+
+    Reject:
+      {
+        "decision": "reject",
+        "reason": "required"
+      }
+
+    FinalMin/FinalMax are automatically taken from the device
+    price table for the chosen grade.
+    """
+    body = request.get_json(silent=True) or {}
+    decision = (body.get("decision") or "").strip()
+
+    if decision not in ("approve", "reject"):
+        return jsonify(error="decision must be approve|reject"), 400
+
+    table = current_app.ddb_table
+    key = {"PK": listing_id, "SK": "LISTING_REQUEST"}
+    resp = table.get_item(Key=key, ConsistentRead=True)
+    item = resp.get("Item")
+    if not item:
+        return jsonify(error="Listing request not found"), 404
+
+    status = item.get("Status", "unverified")
+    if status not in ("unverified", "verified", "rejected"):
+        return jsonify(error=f"Cannot change listing in status {status!r}"), 400
+
+    # Who is deciding?
+    admin_pk = None
+    u = session.get("user")
+    if u:
+        admin_pk = _find_user_pk_by_sub(table, u["sub"])
+
+    now = _iso_now()
+    reason = (body.get("reason") or "").strip()
+
+    # Enforce different admin for subsequent reviews (ReviewRound > 1)
+    prev_admin = item.get("ReviewedBy")
+    round_ = int(item.get("ReviewRound", 1))
+    if prev_admin and admin_pk and round_ > 1 and prev_admin == admin_pk:
+        return jsonify(
+            error="This review round must be handled by a different admin."
+        ), 400
+
+    if decision == "reject":
+        if not reason:
+            return jsonify(error="Reason is required when rejecting."), 400
+
+        table.update_item(
+            Key=key,
+            UpdateExpression=(
+                "SET #st=:rej, ReviewedAt=:ts, ReviewedBy=:adm, "
+                "ReviewReason=:rs"
+            ),
+            ExpressionAttributeNames={"#st": "Status"},
+            ExpressionAttributeValues={
+                ":rej": "rejected",
+                ":ts": now,
+                ":adm": admin_pk,
+                ":rs": reason,
+            },
+        )
+        return jsonify(ok=True, decision="reject")
+
+    # decision == "approve"
+    final_grade = (body.get("finalGrade") or "").strip().upper()
+    if final_grade not in ("A", "B", "C"):
+        return jsonify(error="Final grade must be A, B, or C."), 400
+
+    # Look up device profile to get price range for this grade
+    device_pk = item.get("DevicePK")
+    if not device_pk:
+        return jsonify(error="Listing has no device reference."), 400
+
+    dev_resp = table.get_item(Key={"PK": device_pk, "SK": "PROFILE"})
+    device = dev_resp.get("Item")
+    if not device:
+        return jsonify(error="Device profile not found."), 400
+
+    # Map grade -> min/max fields in the profile
+    if final_grade == "A":
+        min_key, max_key = "Grade_A_MIN", "Grade_A_MAX"
+    elif final_grade == "B":
+        min_key, max_key = "Grade_B_MIN", "Grade_B_MAX"
+    else:  # "C"
+        min_key, max_key = "Grade_C_MIN", "Grade_C_MAX"
+
+    raw_min = device.get(min_key)
+    raw_max = device.get(max_key)
+
+    if raw_min is None or raw_max is None:
+        return jsonify(
+            error=f"Price range for grade {final_grade} is not configured."
+        ), 400
+
+    def to_decimal(x):
+        if isinstance(x, Decimal):
+            return x
+        return Decimal(str(x))
+
+    final_min_dec = to_decimal(raw_min)
+    final_max_dec = to_decimal(raw_max)
+
+    if final_min_dec > final_max_dec:
+        return jsonify(error="Configured price range is invalid."), 400
+
+    table.update_item(
+        Key=key,
+        UpdateExpression=(
+            "SET #st=:ver, FinalGrade=:fg, FinalMin=:fmin, FinalMax=:fmax, "
+            "ReviewedAt=:ts, ReviewedBy=:adm, ReviewReason=:rs"
+        ),
+        ExpressionAttributeNames={"#st": "Status"},
+        ExpressionAttributeValues={
+            ":ver": "verified",
+            ":fg": final_grade,
+            ":fmin": final_min_dec,
+            ":fmax": final_max_dec,
+            ":ts": now,
+            ":adm": admin_pk,
+            ":rs": reason,
+        },
+    )
+    return jsonify(ok=True, decision="approve")

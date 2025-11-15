@@ -32,7 +32,10 @@
     <Compile Include="DeviceLoopBackend\admin_routes.py" />
     <Compile Include="DeviceLoopBackend\auth_routes.py" />
     <Compile Include="DeviceLoopBackend\devices_routes.py" />
+    <Compile Include="DeviceLoopBackend\files_routes.py" />
     <Compile Include="DeviceLoopBackend\guards.py" />
+    <Compile Include="DeviceLoopBackend\s3_utils.py" />
+    <Compile Include="DeviceLoopBackend\seller_routes.py" />
     <Compile Include="runserver.py" />
     <Compile Include="DeviceLoopBackend\__init__.py" />
     <Compile Include="DeviceLoopBackend\views.py" />
@@ -47,6 +50,7 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="DeviceLoopBackend\.env" />
+    <Content Include="DeviceLoopBackend\grading.py" />
     <Content Include="requirements.txt" />
     <Content Include="DeviceLoopBackend\static\content\bootstrap.css" />
     <Content Include="DeviceLoopBackend\static\content\bootstrap.min.css" />

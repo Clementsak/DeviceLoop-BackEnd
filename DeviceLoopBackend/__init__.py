@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 import boto3
 from .admin_routes import bp as admin_bp
 from .devices_routes import bp as devices_bp
+from .seller_routes import bp as seller_bp
+from .files_routes import bp as files_bp
 
 load_dotenv()
 
@@ -38,6 +40,9 @@ def create_app():
     FRONTEND_AFTER_LOGOUT=os.getenv("FRONTEND_AFTER_LOGOUT", "https://localhost:5173/"),
     COGNITO_SIGNOUT_CALLBACK=os.getenv("COGNITO_SIGNOUT_CALLBACK", "https://localhost:5000/auth/signout-callback"),
 
+    S3_UPLOADS_BUCKET=os.getenv("S3_UPLOADS_BUCKET"),
+    S3_PRESIGN_EXPIRE=int(os.getenv("S3_PRESIGN_EXPIRE", "900")),
+
     SESSION_COOKIE_NAME="deviceloop_sess",
     SESSION_COOKIE_SAMESITE="None",   # cross-site during Hosted UI redirects
     SESSION_COOKIE_SECURE=True,       # requires HTTPS
@@ -50,6 +55,9 @@ def create_app():
     resources={
         r"/api/*": {"origins": ["https://localhost:5173"]},
         r"/admin/*": {"origins": ["https://localhost:5173"]},
+        r"/seller/*": {"origins": ["https://localhost:5173"]},
+        r"/files/*": {"origins": ["https://localhost:5173"]},   # ? add this
+
         },
     supports_credentials=True,
     methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -80,5 +88,7 @@ def create_app():
     app.register_blueprint(auth_bp, url_prefix="/auth") # /auth/...
     app.register_blueprint(admin_bp)
     app.register_blueprint(devices_bp)
+    app.register_blueprint(seller_bp)
+    app.register_blueprint(files_bp, url_prefix="/files")
 
     return app
