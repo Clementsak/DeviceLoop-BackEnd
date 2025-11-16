@@ -1,0 +1,20 @@
+# Python venvs
+env/
+env1/
+.venv/
+
+# Secrets
+.env
+
+# Python junk
+__pycache__/
+*.pyc
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Build outputs
+bin/
+obj/
