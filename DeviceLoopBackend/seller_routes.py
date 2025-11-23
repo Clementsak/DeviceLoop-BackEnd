@@ -4,7 +4,7 @@ import os, uuid
 from datetime import datetime, timezone, timedelta
 
 from flask import Blueprint, request, jsonify, current_app, session
-import boto3
+import boto3, json
 from boto3.dynamodb.conditions import Key, Attr
 from decimal import Decimal
 
@@ -13,6 +13,7 @@ from .auth_routes import _find_user_pk_by_sub, _profile_key
 from .grading import compute_initial_grade_and_range, GradeRejected
 
 bp = Blueprint("seller", __name__, url_prefix="/seller")
+SQS_QUEUE_URL = os.environ.get("BIDS_QUEUE_URL")
 
 def _utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -247,7 +248,6 @@ def request_additional_review(listing_id):
     return jsonify({"ok": True, "newRound": round_ + 1})
 
 
-
 @bp.post("/listing-requests/<listing_id>/accept")
 @require_role("sellers", "admin")
 def accept_grade_and_activate(listing_id):
@@ -259,6 +259,11 @@ def accept_grade_and_activate(listing_id):
     seller_min = body.get("sellerMin")
     seller_max = body.get("sellerMax")
     duration = int(body.get("durationHours") or 0)  # 6, 12, 24, 72
+
+    # New: optional auction mode from frontend
+    auction_mode = body.get("auctionMode")
+    if auction_mode not in ("continuous", "interval", "end_of_window"):
+        return jsonify({"error": "Invalid auctionMode."}), 400
 
     if duration not in (6, 12, 24, 72):
         return jsonify({"error": "Invalid duration."}), 400
@@ -281,13 +286,19 @@ def accept_grade_and_activate(listing_id):
     final_min = item.get("FinalMin") or item.get("InitialMin")
     final_max = item.get("FinalMax") or item.get("InitialMax")
 
-     # Ensure numbers
+    # Ensure numbers
     if isinstance(final_min, Decimal):
         final_min = float(final_min)
     if isinstance(final_max, Decimal):
         final_max = float(final_max)
+
     if seller_min < final_min or seller_max > final_max or seller_min > seller_max:
         return jsonify({"error": "Seller price range must be within verified range and valid."}), 400
+
+    # New: compute MarketKey from DevicePK + grade snapshot
+    device_pk = item.get("DevicePK")
+    grade = item.get("FinalGrade")
+    market_key = f"{device_pk}#{grade}"
 
     now = datetime.now(timezone.utc)
     start = now.isoformat()
@@ -298,6 +309,7 @@ def accept_grade_and_activate(listing_id):
         UpdateExpression=(
             "SET SellerMin = :smin, SellerMax = :smax, DurationHours = :dur, "
             "AuctionStartsAt = :start, AuctionEndsAt = :end, "
+            "MarketKey = :market, AuctionMode = :mode, "
             "#st = :active, UpdatedAt = :now"
         ),
         ExpressionAttributeNames={"#st": "Status"},
@@ -307,11 +319,26 @@ def accept_grade_and_activate(listing_id):
             ":dur": duration,
             ":start": start,
             ":end": end,
+            ":market": market_key,
+            ":mode": auction_mode,
             ":active": "active",
             ":now": start,
         },
     )
+
+    if auction_mode == "continuous" and SQS_QUEUE_URL:
+        sqs = boto3.client("sqs", region_name=current_app.config["AWS_REGION"])
+        sqs.send_message(
+            QueueUrl=SQS_QUEUE_URL,
+            MessageBody=json.dumps({
+                "type": "NEW_LISTING",
+                "marketKey": market_key,
+                "listingId": listing_id,
+            }),
+        )
+
     return jsonify({"ok": True})
+
 
 @bp.get("/listings/<listing_id>")
 @require_role("sellers", "admin")
@@ -496,6 +523,8 @@ def list_listing_requests():
             "AuctionEndsAt": it.get("AuctionEndsAt"),
             "CurrentHighestBid": _num(it.get("CurrentHighestBid")),
             "CurrentHighestBidderPK": it.get("CurrentHighestBidderPK"),
+            "MarketKey": it.get("MarketKey"),
+            "AuctionMode": it.get("AuctionMode"),
         }
 
     # First map all Dynamo items into the shape expected by the frontend
