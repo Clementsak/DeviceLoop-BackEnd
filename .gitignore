@@ -1,0 +1,14 @@
+﻿# Visual Studio
+.vs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Logs
+*.log
