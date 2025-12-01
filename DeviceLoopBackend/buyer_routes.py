@@ -558,26 +558,28 @@ def browse_listings():
 @require_role("buyers", "sellers", "admin")
 def list_device_markets():
     """
-    Aggregate view of active markets (DevicePK + grade).
+    Aggregate view of active markets (device + grade).
 
-    Optional query params:
+    Optional query parameters:
       ?category=...
       &brand=...
       &model=...
       &grade=A
 
-    Returns one row per MarketKey with counts and price bands.
+    Returns one row per MarketKey with:
+      - counts of active listings per auction mode
+      - seller price range across listings
+      - platform range and release info from PROFILE row
+      - number of open bids and distinct bidders
     """
     table = current_app.ddb_table
 
-    # 1) Scan all active listing requests
+    # === 1) Active listings (LISTING_REQUEST) ===
     resp = table.scan(
-        FilterExpression=Attr("SK").eq("LISTING_REQUEST")
-        & Attr("Status").eq("active")
+        FilterExpression=Attr("SK").eq("LISTING_REQUEST") & Attr("Status").eq("active")
     )
-    items = resp.get("Items", []) or []
+    listing_items = resp.get("Items", []) or []
 
-    # 2) Read optional filters
     q_category = request.args.get("category")
     q_brand = request.args.get("brand")
     q_model = request.args.get("model")
@@ -588,18 +590,20 @@ def list_device_markets():
             return float(v)
         try:
             return float(v)
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
-    # Cache device metadata so we only query PROFILE once per devicePk+grade
-    meta_cache: dict[tuple[str, str], dict] = {}
+    markets: dict[str, dict] = {}
 
-    def get_meta(device_pk: str, grade: str) -> dict:
+    # Cache for PROFILE lookups
+    profile_cache: dict[tuple[str, str], dict] = {}
+
+    def get_profile_meta(device_pk: str, grade: str) -> dict:
         key = (device_pk, grade)
-        if key in meta_cache:
-            return meta_cache[key]
+        if key in profile_cache:
+            return profile_cache[key]
 
-        out = {
+        meta = {
             "platformMin": None,
             "platformMax": None,
             "releasePrice": None,
@@ -608,34 +612,35 @@ def list_device_markets():
 
         try:
             resp = table.get_item(Key={"PK": device_pk, "SK": "PROFILE"})
-            item = resp.get("Item") or {}
+            prof = resp.get("Item") or {}
         except Exception:
-            item = {}
+            prof = {}
 
-        if item:
+        if prof:
             if grade == "A":
-                min_v = item.get("Grade_A_MIN")
-                max_v = item.get("Grade_A_MAX")
+                min_v = prof.get("Grade_A_MIN")
+                max_v = prof.get("Grade_A_MAX")
             elif grade == "B":
-                min_v = item.get("Grade_B_MIN")
-                max_v = item.get("Grade_B_MAX")
+                min_v = prof.get("Grade_B_MIN")
+                max_v = prof.get("Grade_B_MAX")
             elif grade == "C":
-                min_v = item.get("Grade_C_MIN")
-                max_v = item.get("Grade_C_MAX")
+                min_v = prof.get("Grade_C_MIN")
+                max_v = prof.get("Grade_C_MAX")
             else:
                 min_v = max_v = None
 
-            out["platformMin"] = _num(min_v)
-            out["platformMax"] = _num(max_v)
-            out["releasePrice"] = _num(item.get("ReleasePrice"))
-            out["releaseDate"] = item.get("ReleaseDate")
+            meta["platformMin"] = _num(min_v)
+            meta["platformMax"] = _num(max_v)
+            meta["releasePrice"] = _num(prof.get("ReleasePrice"))
+            meta["releaseDate"] = prof.get("ReleaseDate")
 
-        meta_cache[key] = out
-        return out
+        profile_cache[key] = meta
+        return meta
 
-    markets: dict[str, dict] = {}
+    now = datetime.now(timezone.utc)
 
-    for it in items:
+    # First pass: aggregate listings
+    for it in listing_items:
         if q_category and it.get("Category") != q_category:
             continue
         if q_brand and it.get("Brand") != q_brand:
@@ -647,17 +652,27 @@ def list_device_markets():
         if q_grade and grade != q_grade:
             continue
 
+        # Drop listings that have already ended, even if Status is still "active"
+        ends_at_str = it.get("AuctionEndsAt")
+        if ends_at_str:
+            try:
+                ends_at = datetime.fromisoformat(ends_at_str)
+                if ends_at <= now:
+                    continue
+            except Exception:
+                # If invalid timestamp, keep the listing rather than hiding silently
+                pass
+
         market_key = it.get("MarketKey")
         device_pk = it.get("DevicePK")
         if not market_key or not device_pk or not grade:
             continue
 
-        auction_mode = it.get("AuctionMode") or "continuous"
+        auction_mode = (it.get("AuctionMode") or "continuous").lower()
 
-        m = markets.get(market_key)
-        if not m:
+        if market_key not in markets:
             meta = (
-                get_meta(device_pk, grade)
+                get_profile_meta(device_pk, grade)
                 if device_pk and grade
                 else {
                     "platformMin": None,
@@ -667,7 +682,7 @@ def list_device_markets():
                 }
             )
 
-            m = {
+            markets[market_key] = {
                 "marketKey": market_key,
                 "devicePk": device_pk,
                 "category": it.get("Category"),
@@ -687,9 +702,12 @@ def list_device_markets():
                 "platformMax": meta["platformMax"],
                 "releasePrice": meta["releasePrice"],
                 "releaseDate": meta["releaseDate"],
+                # will be filled in second pass
+                "numBids": 0,
+                "numBidders": 0,
             }
-            markets[market_key] = m
 
+        m = markets[market_key]
         m["numListings"] += 1
         if auction_mode == "continuous":
             m["numContinuous"] += 1
@@ -700,7 +718,6 @@ def list_device_markets():
 
         seller_min = _num(it.get("SellerMin"))
         seller_max = _num(it.get("SellerMax"))
-
         if seller_min is not None:
             if m["sellerRangeMin"] is None or seller_min < m["sellerRangeMin"]:
                 m["sellerRangeMin"] = seller_min
@@ -708,7 +725,46 @@ def list_device_markets():
             if m["sellerRangeMax"] is None or seller_max > m["sellerRangeMax"]:
                 m["sellerRangeMax"] = seller_max
 
+    # === 2) Open bids per market ===
+    bids_resp = table.scan(
+        FilterExpression=Attr("Type").eq("BID") & Attr("BidStatus").eq("open")
+    )
+    bid_items = bids_resp.get("Items", []) or []
+
+    bidders_by_market: dict[str, set] = {}
+
+    for bid in bid_items:
+        market_key = bid.get("MarketKey")
+        if not market_key:
+            continue
+
+        # Only care about bids for markets that have listings
+        m = markets.get(market_key)
+        if not m:
+            continue
+
+        # Ignore expired bids
+        expires_at_str = bid.get("BidExpiresAt")
+        if expires_at_str:
+            try:
+                expires_at = datetime.fromisoformat(expires_at_str)
+                if expires_at <= now:
+                    continue
+            except Exception:
+                pass
+
+        m["numBids"] += 1
+        buyer_pk = bid.get("BuyerPK")
+        if buyer_pk:
+            bidders_by_market.setdefault(market_key, set()).add(buyer_pk)
+
+    for market_key, bidder_set in bidders_by_market.items():
+        m = markets.get(market_key)
+        if m:
+            m["numBidders"] = len(bidder_set)
+
     return jsonify({"ok": True, "items": list(markets.values())})
+
 
 
 @bp.get("/device-market")
