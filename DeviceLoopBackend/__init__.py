@@ -1,14 +1,18 @@
-# __init__.py
+﻿# __init__.py
 import os
 from flask import Flask
 from flask_cors import CORS
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 import boto3
+
+load_dotenv()
+
 from .admin_routes import bp as admin_bp
 from .devices_routes import bp as devices_bp
 from .seller_routes import bp as seller_bp
 from .files_routes import bp as files_bp
+from .buyer_routes import bp as buyer_bp
 
 load_dotenv()
 
@@ -39,6 +43,9 @@ def create_app():
     FRONTEND_AFTER_LOGIN=os.getenv("FRONTEND_AFTER_LOGIN", "https://localhost:5173/"),
     FRONTEND_AFTER_LOGOUT=os.getenv("FRONTEND_AFTER_LOGOUT", "https://localhost:5173/"),
     COGNITO_SIGNOUT_CALLBACK=os.getenv("COGNITO_SIGNOUT_CALLBACK", "https://localhost:5000/auth/signout-callback"),
+    AWS_LOCATION_INDEX=os.getenv("AWS_LOCATION_INDEX", "deviceloop-place-index"),
+    BIDS_QUEUE_URL=os.environ.get("BIDS_QUEUE_URL"),
+
 
     S3_UPLOADS_BUCKET=os.getenv("S3_UPLOADS_BUCKET"),
     S3_PRESIGN_EXPIRE=int(os.getenv("S3_PRESIGN_EXPIRE", "900")),
@@ -51,18 +58,19 @@ def create_app():
 
 # CORS: your frontend is now https://localhost:5173
     CORS(
-    app,
-    resources={
-        r"/api/*": {"origins": ["https://localhost:5173"]},
-        r"/admin/*": {"origins": ["https://localhost:5173"]},
-        r"/seller/*": {"origins": ["https://localhost:5173"]},
-        r"/files/*": {"origins": ["https://localhost:5173"]},   # ? add this
-
+        app,
+        supports_credentials=True,
+        resources={
+            r"/auth/*":   {"origins": ["https://localhost:5173"]},
+            r"/api/*":    {"origins": ["https://localhost:5173"]},
+            r"/admin/*":  {"origins": ["https://localhost:5173"]},
+            r"/seller/*": {"origins": ["https://localhost:5173"]},
+            r"/buyer/*":  {"origins": ["https://localhost:5173"]},  # 👈 ADD THIS
+            r"/files/*":  {"origins": ["https://localhost:5173"]},
         },
-    supports_credentials=True,
-    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept", "Authorization"],
     )
+
+
 
 
     # --- Authlib (Cognito OIDC) ---
@@ -72,6 +80,7 @@ def create_app():
     CLIENT_ID      = os.getenv("COGNITO_CLIENT_ID", "1erabgmlso22dt99armn0d0un1")
     CLIENT_SECRET  = os.getenv("COGNITO_CLIENT_SECRET", "<client secret>")
     ISSUER         = f"{COGNITO_DOMAIN}/{USERPOOL_ID}"
+
 
     oauth.register(
         name="oidc",
@@ -90,5 +99,6 @@ def create_app():
     app.register_blueprint(devices_bp)
     app.register_blueprint(seller_bp)
     app.register_blueprint(files_bp, url_prefix="/files")
+    app.register_blueprint(buyer_bp)
 
     return app

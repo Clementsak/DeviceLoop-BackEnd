@@ -92,6 +92,27 @@ def _sync_role_ddb(table, user_pk: str, new_role: str, groups: list[str]):
         },
     )
 
+def _cognito_ver_flags(sub: str | None) -> dict:
+    """
+    Returns {'emailVerified': bool|None, 'phoneVerified': bool|None}
+    """
+    if not sub:
+        return {"emailVerified": None, "phoneVerified": None}
+    try:
+        resp = _idp().admin_get_user(
+            UserPoolId=_user_pool_id(),
+            Username=sub,
+        )
+    except ClientError:
+        return {"emailVerified": None, "phoneVerified": None}
+
+    attrs = {a["Name"]: a["Value"] for a in resp.get("UserAttributes", [])}
+    return {
+        "emailVerified": attrs.get("email_verified") == "true",
+        "phoneVerified": attrs.get("phone_number_verified") == "true",
+    }
+
+
 # --- Routes ---
 
 @bp.get("/users")
@@ -144,15 +165,31 @@ def list_users():
     if verified in {"pending", "verified", "rejected"}:
         items = [i for i in items if i.get("VerifiedStatus", "pending") == verified]
 
-    users = [{
-        "user_pk": it["PK"],
-        "email": it.get("Email"),
-        "role": it.get("Role", "buyers"),
-        "isVerified": bool(it.get("IsVerified", False)),
-        "verifiedStatus": it.get("VerifiedStatus", "pending"),
-        "lastLogin": it.get("LastLoginAt"),
-        "groups": it.get("Groups", []),
-    } for it in items if it]
+    users: list[dict] = []
+    for it in items:
+        if not it:
+            continue
+
+        sub = it.get("Sub")
+        flags = _cognito_ver_flags(sub)
+
+        users.append({
+            "user_pk": it["PK"],
+            "email": it.get("Email"),
+            "role": it.get("Role", "buyers"),
+
+            # Your DDB-level buyer verification (location + admin decision)
+            "isVerified": bool(it.get("IsVerified", False)),
+            "verifiedStatus": it.get("VerifiedStatus", "pending"),
+
+            # Cognito-level verification for login contact details
+            "emailVerified": flags["emailVerified"],
+            "phoneVerified": flags["phoneVerified"],
+
+            "lastLogin": it.get("LastLoginAt"),
+            "groups": it.get("Groups", []),
+        })
+
 
     return jsonify(items=users, cursor=next_cursor)
 
@@ -326,7 +363,6 @@ def admin_list_listing_requests():
       ?limit=50
     """
     status = (request.args.get("status") or "unverified").strip()
-    limit = max(1, min(int(request.args.get("limit", "50")), 200))
 
     table = _table()
 
@@ -335,8 +371,15 @@ def admin_list_listing_requests():
         fe = fe & Attr("Status").eq(status)
 
     items: list[dict] = []
-    resp = table.scan(FilterExpression=fe, Limit=limit)
+    resp = table.scan(FilterExpression=fe)
     items.extend(resp.get("Items", []))
+
+    while resp.get("LastEvaluatedKey"):
+        resp = table.scan(
+            FilterExpression=fe,
+            ExclusiveStartKey=resp["LastEvaluatedKey"],
+        )
+        items.extend(resp.get("Items", []))
 
     # If you want to support pagination later you can loop on LastEvaluatedKey.
 

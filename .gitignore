@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 ﻿# Visual Studio
+=======
+﻿# Ignore Visual Studio
+>>>>>>> a85753d3133c0c3cc253f59a147d066301bfa193
 .vs/
 
 # Python cache
@@ -10,5 +14,9 @@ __pycache__/
 env/
 venv/
 
+<<<<<<< HEAD
 # Logs
+=======
+# Other unnecessary files
+>>>>>>> a85753d3133c0c3cc253f59a147d066301bfa193
 *.log
