@@ -933,7 +933,7 @@ def admin_import_prices():
     return jsonify(ok=True, created=0, updated=updated, skipped=skipped, errors=errors)
 
 @bp.get("/options")
-@require_role("sellers", "admin")
+@require_role("buyers", "sellers", "admin")
 def device_options():
     """
     Return all PROFILE rows (active devices) that have platform pricing

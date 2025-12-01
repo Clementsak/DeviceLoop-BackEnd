@@ -9,6 +9,8 @@ import boto3
 import json
 import os
 from boto3.dynamodb.conditions import Attr, Key
+from .s3_utils import presign_get
+import urllib.parse
 
 from .guards import require_role
 from .auth_routes import _find_user_pk_by_sub, _profile_key
@@ -157,143 +159,126 @@ def submit_location_verification():
 @require_role("buyers", "admin")
 def submit_bid():
     """
-    Place a bid into the double auction for a given listing's market.
+    Create a *market-level* bid for a given device + grade.
 
-    Body (example):
+    This is called by the BidWizardModal.
+
+    Expected JSON body (from the wizard):
+
       {
-        "listingId": "LISTREQ#SELLER123#1700000000",
-        "bidPrice": 3150.0,
-        "buyerMin": 3000.0,   // optional, for analytics
-        "buyerMax": 3400.0    // optional, for analytics
+        "devicePk": "DEVICE#083A",
+        "grade": "A",
+        "mode": "interval" | "end_of_window" | "continuous",
+        "buyerMin": 6200.0,
+        "buyerMax": 6500.0,
+        "finalBid": 6300.0,
+        "bandLow": 6200.0,
+        "bandHigh": 6300.0,
+        "isBuyout": true | false
       }
+
+    Notes:
+      * We do NOT tie the bid to a specific listing anymore.
+      * We still send a NEW_BID message to SQS so your existing
+        deviceloop-bids-matcher / deviceloop-bids-clearing Lambdas
+        keep working with the same message shape.
     """
     buyer_pk = _buyer_pk_from_session()
     if not buyer_pk:
         return ("Unauthorized", 401)
 
-    data = request.get_json(force=True) or {}
-    listing_id = data.get("listingId")
-    bid_price = data.get("bidPrice")
-    buyer_min = data.get("buyerMin")
-    buyer_max = data.get("buyerMax")
+    data = request.get_json(silent=True) or {}
 
-    if not listing_id:
-        return jsonify(error="listingId is required"), 400
+    device_pk = data.get("devicePk")
+    grade = data.get("grade")
+    mode = data.get("mode") or "continuous"  # default for wizard
+
+    if not device_pk:
+        return jsonify(error="devicePk is required"), 400
+    if not grade:
+        return jsonify(error="grade is required"), 400
+
+    # ----- parse numeric fields -----
+    def _parse_float(val, field_name, required=False):
+        if val is None:
+            if required:
+                raise ValueError(f"{field_name} is required")
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field_name} must be a number")
 
     try:
-        bid_price = float(bid_price)
-    except (TypeError, ValueError):
-        return jsonify(error="bidPrice (number) is required"), 400
+        bid_price = _parse_float(data.get("finalBid") or data.get("bidPrice"), "finalBid", required=True)
+        buyer_min = _parse_float(data.get("buyerMin"), "buyerMin")
+        buyer_max = _parse_float(data.get("buyerMax"), "buyerMax")
+        band_low = _parse_float(data.get("bandLow"), "bandLow")
+        band_high = _parse_float(data.get("bandHigh"), "bandHigh")
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
 
     if bid_price <= 0:
-        return jsonify(error="bidPrice must be positive"), 400
+        return jsonify(error="finalBid must be positive"), 400
+
+    # Basic sanity checks inside the user's envelope (frontend already
+    # enforces platform range + 20% band logic).
+    if buyer_min is not None and buyer_max is not None and buyer_min > buyer_max:
+        return jsonify(error="buyerMin must be <= buyerMax"), 400
+
+    if buyer_min is not None and bid_price < buyer_min:
+        return jsonify(error="finalBid must be >= buyerMin"), 400
+
+    if buyer_max is not None and bid_price > buyer_max:
+        return jsonify(error="finalBid must be <= buyerMax"), 400
+
+    is_buyout = bool(data.get("isBuyout"))
 
     table = current_app.ddb_table
 
-    # 1) Load listing to get MarketKey, AuctionMode, price envelope, and auction window
-    resp = table.get_item(Key={"PK": listing_id, "SK": "LISTING_REQUEST"}, ConsistentRead=True)
-    listing = resp.get("Item")
-    if not listing:
-        return jsonify(error="Listing not found"), 404
+    # ----- build MarketKey consistent with existing code -----
+    # DevicePK is like "DEVICE#083A", so MarketKey becomes "DEVICE#083A#A"
+    market_key = f"{device_pk}#{grade}"
 
-    status = listing.get("Status")
-    if status != "active":
-        return jsonify(error="Listing is not active"), 400
-
-    # Ensure we are inside the auction window
-    now = datetime.now(timezone.utc)
-    starts_at_str = listing.get("AuctionStartsAt")
-    ends_at_str = listing.get("AuctionEndsAt")
-
-    try:
-        if starts_at_str:
-            starts_at = datetime.fromisoformat(starts_at_str)
-            if now < starts_at:
-                return jsonify(error="Auction has not started yet"), 400
-        if ends_at_str:
-            ends_at = datetime.fromisoformat(ends_at_str)
-            if now > ends_at:
-                return jsonify(error="Auction has already ended"), 400
-    except ValueError:
-        # If timestamps are malformed, be safe
-        return jsonify(error="Listing has invalid auction timestamps"), 500
-
-    # Price envelope checks (FinalMin/FinalMax)
-    final_min = listing.get("FinalMin") or listing.get("InitialMin")
-    final_max = listing.get("FinalMax") or listing.get("InitialMax")
-
-    if isinstance(final_min, Decimal):
-        final_min = float(final_min)
-    if isinstance(final_max, Decimal):
-        final_max = float(final_max)
-
-    if final_min is not None and bid_price < final_min:
-        return jsonify(error="Bid is below platform minimum for this listing"), 400
-    if final_max is not None and bid_price > final_max:
-        return jsonify(error="Bid is above platform maximum for this listing"), 400
-
-    # Seller envelope check (SellerMin/SellerMax)
-    seller_min = listing.get("SellerMin")
-    seller_max = listing.get("SellerMax")
-    if isinstance(seller_min, Decimal):
-        seller_min = float(seller_min)
-    if isinstance(seller_max, Decimal):
-        seller_max = float(seller_max)
-
-    if seller_min is not None and bid_price < seller_min:
-        return jsonify(error="Bid is below seller minimum"), 400
-    if seller_max is not None and bid_price > seller_max:
-        return jsonify(error="Bid is above seller maximum"), 400
-
-    market_key = listing.get("MarketKey")
-    if not market_key:
-        # Fallback: compute from DevicePK + grade
-        device_pk = listing.get("DevicePK")
-        grade = listing.get("FinalGrade") or listing.get("InitialGrade") or "Unknown"
-        market_key = f"{device_pk}#{grade}"
-
-    auction_mode = listing.get("AuctionMode") or "continuous"
-
-    # 2) Create Bid item in DynamoDB
     bid_now = datetime.now(timezone.utc)
     bid_expires_at = bid_now + timedelta(hours=24)
 
     pk = f"MARKET#{market_key}"
     sk = f"BID#{int(bid_now.timestamp())}#{buyer_pk}"
 
+    from decimal import Decimal as _Dec
+
     bid_item = {
         "PK": pk,
         "SK": sk,
         "Type": "BID",
         "MarketKey": market_key,
-        "ListingPK": listing_id,
         "BuyerPK": buyer_pk,
-        "BidPrice": Decimal(str(bid_price)),
+        "DevicePK": device_pk,
+        "Grade": grade,
+        "BidPrice": _Dec(str(bid_price)),
+        "BuyerMin": _Dec(str(buyer_min)) if buyer_min is not None else None,
+        "BuyerMax": _Dec(str(buyer_max)) if buyer_max is not None else None,
+        "BandLow": _Dec(str(band_low)) if band_low is not None else None,
+        "BandHigh": _Dec(str(band_high)) if band_high is not None else None,
+        "IsBuyout": is_buyout,
         "BidStatus": "open",
+        "AuctionModeSnapshot": mode,
         "PlacedAt": bid_now.isoformat(),
         "BidExpiresAt": bid_expires_at.isoformat(),
-        "AuctionModeSnapshot": auction_mode,
         "EditCount": 0,
     }
 
-    # Optional: store original min/max for analysis
-    if buyer_min is not None:
-        try:
-            bid_item["BuyerMin"] = Decimal(str(float(buyer_min)))
-        except (TypeError, ValueError):
-            pass
-    if buyer_max is not None:
-        try:
-            bid_item["BuyerMax"] = Decimal(str(float(buyer_max)))
-        except (TypeError, ValueError):
-            pass
+    # Remove None fields so DynamoDB is happy
+    bid_item = {k: v for k, v in bid_item.items() if v is not None}
 
     table.put_item(Item=bid_item)
 
-    # 3) Send message to SQS for Lambda to process
-    queue_url = current_app.config.get("BIDS_QUEUE_URL") or os.environ.get("BIDS_QUEUE_URL")
+    # ----- push NEW_BID to SQS (same structure as before) -----
+    queue_url = current_app.config.get("BIDS_QUEUE_URL") or os.environ.get(
+        "BIDS_QUEUE_URL"
+    )
     if not queue_url:
-        # In development you might want to just log and skip
         return jsonify(error="BIDS_QUEUE_URL is not configured"), 500
 
     sqs = _sqs_client()
@@ -305,20 +290,24 @@ def submit_bid():
                 "marketKey": market_key,
                 "bidPk": pk,
                 "bidSk": sk,
-                "auctionMode": auction_mode,
+                "auctionMode": mode,
             }
         ),
     )
 
-    return jsonify(
-        {
-            "ok": True,
-            "marketKey": market_key,
-            "bidPk": pk,
-            "bidSk": sk,
-            "expiresAt": bid_expires_at.isoformat(),
-        }
-    ), 201
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "marketKey": market_key,
+                "bidPk": pk,
+                "bidSk": sk,
+                "expiresAt": bid_expires_at.isoformat(),
+            }
+        ),
+        201,
+    )
+
 
 @bp.post("/bids/edit")
 @require_role("buyers")
@@ -469,7 +458,6 @@ def cancel_bid():
 
     return jsonify({"ok": True, "bidPk": bid_pk, "bidSk": bid_sk})
 
-
 @bp.get("/listings")
 @require_role("buyers", "admin")
 def browse_listings():
@@ -514,10 +502,6 @@ def browse_listings():
         grade = it.get("FinalGrade") or it.get("InitialGrade")
         if q_grade and grade != q_grade:
             continue
-        auction_mode = it.get("AuctionMode") or "continuous"
-        if auction_mode != "continuous":
-            # hide interval / end_of_window on this page
-            continue
         ends_at_str = it.get("AuctionEndsAt")
         if ends_at_str:
             try:
@@ -532,6 +516,17 @@ def browse_listings():
         # Normalise numeric fields to plain floats for frontend
         def _num(x):
             return float(x) if isinstance(x, Decimal) else x
+
+        # ✅ NEW: extract the "front" photo key and presign it
+        photos = it.get("Photos") or {}
+        # new var: photo_front_key = the raw S3 key, taken from the "Front" label (case-insensitive)
+        photo_front_key = (
+            photos.get("Front")
+            or photos.get("front")
+            or photos.get("FRONT")
+        )
+        # new var: thumbnail_url = temporary HTTPS URL generated by backend for that S3 key
+        thumbnail_url = presign_get(photo_front_key) if photo_front_key else None
 
         filtered.append(
             {
@@ -550,13 +545,223 @@ def browse_listings():
                 "finalMin": _num(it.get("FinalMin") or it.get("InitialMin")),
                 "finalMax": _num(it.get("FinalMax") or it.get("InitialMax")),
                 "status": it.get("Status"),
-                "auctionMode": auction_mode,
+                "auctionMode": it.get("AuctionMode"),
                 "auctionStartsAt": it.get("AuctionStartsAt"),
                 "auctionEndsAt": it.get("AuctionEndsAt"),
+                "thumbnailUrl": thumbnail_url,
             }
         )
 
     return jsonify({"ok": True, "items": filtered})
+
+@bp.get("/markets")
+@require_role("buyers", "sellers", "admin")
+def list_device_markets():
+    """
+    Aggregate view of active markets (DevicePK + grade).
+
+    Optional query params:
+      ?category=...
+      &brand=...
+      &model=...
+      &grade=A
+
+    Returns one row per MarketKey with counts and price bands.
+    """
+    table = current_app.ddb_table
+
+    # 1) Scan all active listing requests
+    resp = table.scan(
+        FilterExpression=Attr("SK").eq("LISTING_REQUEST")
+        & Attr("Status").eq("active")
+    )
+    items = resp.get("Items", []) or []
+
+    # 2) Read optional filters
+    q_category = request.args.get("category")
+    q_brand = request.args.get("brand")
+    q_model = request.args.get("model")
+    q_grade = (request.args.get("grade") or "").upper()
+
+    def _num(v):
+        if isinstance(v, Decimal):
+            return float(v)
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    # Cache device metadata so we only query PROFILE once per devicePk+grade
+    meta_cache: dict[tuple[str, str], dict] = {}
+
+    def get_meta(device_pk: str, grade: str) -> dict:
+        key = (device_pk, grade)
+        if key in meta_cache:
+            return meta_cache[key]
+
+        out = {
+            "platformMin": None,
+            "platformMax": None,
+            "releasePrice": None,
+            "releaseDate": None,
+        }
+
+        try:
+            resp = table.get_item(Key={"PK": device_pk, "SK": "PROFILE"})
+            item = resp.get("Item") or {}
+        except Exception:
+            item = {}
+
+        if item:
+            if grade == "A":
+                min_v = item.get("Grade_A_MIN")
+                max_v = item.get("Grade_A_MAX")
+            elif grade == "B":
+                min_v = item.get("Grade_B_MIN")
+                max_v = item.get("Grade_B_MAX")
+            elif grade == "C":
+                min_v = item.get("Grade_C_MIN")
+                max_v = item.get("Grade_C_MAX")
+            else:
+                min_v = max_v = None
+
+            out["platformMin"] = _num(min_v)
+            out["platformMax"] = _num(max_v)
+            out["releasePrice"] = _num(item.get("ReleasePrice"))
+            out["releaseDate"] = item.get("ReleaseDate")
+
+        meta_cache[key] = out
+        return out
+
+    markets: dict[str, dict] = {}
+
+    for it in items:
+        if q_category and it.get("Category") != q_category:
+            continue
+        if q_brand and it.get("Brand") != q_brand:
+            continue
+        if q_model and it.get("Model") != q_model:
+            continue
+
+        grade = (it.get("FinalGrade") or it.get("InitialGrade") or "").upper()
+        if q_grade and grade != q_grade:
+            continue
+
+        market_key = it.get("MarketKey")
+        device_pk = it.get("DevicePK")
+        if not market_key or not device_pk or not grade:
+            continue
+
+        auction_mode = it.get("AuctionMode") or "continuous"
+
+        m = markets.get(market_key)
+        if not m:
+            meta = (
+                get_meta(device_pk, grade)
+                if device_pk and grade
+                else {
+                    "platformMin": None,
+                    "platformMax": None,
+                    "releasePrice": None,
+                    "releaseDate": None,
+                }
+            )
+
+            m = {
+                "marketKey": market_key,
+                "devicePk": device_pk,
+                "category": it.get("Category"),
+                "brand": it.get("Brand"),
+                "model": it.get("Model"),
+                "variant": it.get("Variant"),
+                "storage": it.get("Storage"),
+                "ram": it.get("RAM"),
+                "grade": grade,
+                "numListings": 0,
+                "numContinuous": 0,
+                "numInterval": 0,
+                "numEndOfWindow": 0,
+                "sellerRangeMin": None,
+                "sellerRangeMax": None,
+                "platformMin": meta["platformMin"],
+                "platformMax": meta["platformMax"],
+                "releasePrice": meta["releasePrice"],
+                "releaseDate": meta["releaseDate"],
+            }
+            markets[market_key] = m
+
+        m["numListings"] += 1
+        if auction_mode == "continuous":
+            m["numContinuous"] += 1
+        elif auction_mode == "interval":
+            m["numInterval"] += 1
+        elif auction_mode == "end_of_window":
+            m["numEndOfWindow"] += 1
+
+        seller_min = _num(it.get("SellerMin"))
+        seller_max = _num(it.get("SellerMax"))
+
+        if seller_min is not None:
+            if m["sellerRangeMin"] is None or seller_min < m["sellerRangeMin"]:
+                m["sellerRangeMin"] = seller_min
+        if seller_max is not None:
+            if m["sellerRangeMax"] is None or seller_max > m["sellerRangeMax"]:
+                m["sellerRangeMax"] = seller_max
+
+    return jsonify({"ok": True, "items": list(markets.values())})
+
+
+@bp.get("/device-market")
+@require_role("buyers", "sellers", "admin")  # or just "buyers"
+def get_device_market_range():
+    """
+    Given a DevicePK and grade (A/B/C), return the platform price range
+    for that grade, plus optional release price / release date.
+
+    This is used by BidWizardModal to show the allowed bidding band.
+    """
+    table = current_app.ddb_table
+
+    device_pk = request.args.get("devicePk")
+    grade = (request.args.get("grade") or "").upper()
+
+    if not device_pk or not grade:
+        return jsonify(error="devicePk and grade are required"), 400
+
+    # Look up the device PROFILE row
+    resp = table.get_item(Key={"PK": device_pk, "SK": "PROFILE"})
+    item = resp.get("Item")
+    if not item:
+        return jsonify(error="Device not found"), 404
+
+    def _num(v):
+        if isinstance(v, Decimal):
+            return float(v)
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    if grade == "A":
+        min_v = item.get("Grade_A_MIN")
+        max_v = item.get("Grade_A_MAX")
+    elif grade == "B":
+        min_v = item.get("Grade_B_MIN")
+        max_v = item.get("Grade_B_MAX")
+    elif grade == "C":
+        min_v = item.get("Grade_C_MIN")
+        max_v = item.get("Grade_C_MAX")
+    else:
+        return jsonify(error="grade must be A, B, or C"), 400
+
+    out = {
+        "platformMin": _num(min_v),
+        "platformMax": _num(max_v),
+        "releasePrice": _num(item.get("ReleasePrice")),
+        "releaseDate": item.get("ReleaseDate"),
+    }
+
+    return jsonify(out)
 
 @bp.get("/notifications/unread-count")
 @require_role("buyers", "sellers", "admin")
@@ -581,6 +786,10 @@ def get_unread_notifications_count():
 @bp.get("/notifications")
 @require_role("buyers", "sellers", "admin")
 def list_notifications():
+    """
+    Return notifications for the current user in the shape expected by the
+    React NotificationsPage (id, type, title, message, createdAt, isRead).
+    """
     user_pk = _user_pk_from_session()
     if not user_pk:
         return ("Unauthorized", 401)
@@ -590,30 +799,75 @@ def list_notifications():
 
     resp = table.query(
         KeyConditionExpression=Key("PK").eq(notif_pk),
-        Limit=50,
-        ScanIndexForward=False,
+        ScanIndexForward=False,  # newest first
+        Limit=int(request.args.get("limit", 100)),
     )
     items = resp.get("Items", [])
 
-    # Small projection for the front end
-    projected = []
-    for it in items:
+    def _format_rm(value):
+        try:
+            return f"RM {float(value):,.2f}"
+        except Exception:
+            return "the agreed price"
+
+    projected: list[dict] = []
+
+    for raw in items:
+        notif_type = raw.get("Type") or "generic"
+        user_role = raw.get("UserRole") or "buyer"
+        market_key = raw.get("MarketKey") or ""
+        trade_price = raw.get("TradePrice")
+        created_at = raw.get("CreatedAt")
+        is_read = bool(raw.get("Read", False))
+
+        # --- Build human friendly title + message ---------------------------
+        if notif_type == "trade_filled":
+            price_str = _format_rm(trade_price)
+
+            if user_role == "buyer":
+                title = "Your bid has been matched"
+                message = (
+                    f"Your bid in market {market_key} has been matched at {price_str}. "
+                    "Please proceed to checkout to complete the purchase."
+                )
+            elif user_role == "seller":
+                title = "Your listing has been matched with a buyer"
+                message = (
+                    f"Your listing in market {market_key} has been matched with a buyer "
+                    f"at {price_str}. Check your seller dashboard for the trade details."
+                )
+            else:
+                title = "Trade matched"
+                message = (
+                    f"A trade in market {market_key} was matched at {price_str}."
+                )
+        else:
+            # Fallback for any other notification types
+            title = "Update on your bids and listings"
+            message = "You have a new notification in DeviceLoop."
+
         projected.append(
             {
-                "pk": it["PK"],
-                "sk": it["SK"],
-                "type": it.get("Type"),
-                "userRole": it.get("UserRole"),
-                "listingPk": it.get("ListingPK"),
-                "devicePk": it.get("DevicePK"),
-                "marketKey": it.get("MarketKey"),
-                "tradePrice": float(it.get("TradePrice", 0)),
-                "createdAt": it.get("CreatedAt"),
-                "read": bool(it.get("Read")),
+                # Simple identifier for React – we just use SK
+                "id": raw.get("SK"),
+                "type": notif_type,
+                "title": title,
+                "message": message,
+                "createdAt": created_at,
+                "isRead": is_read,
             }
         )
 
-    return jsonify({"ok": True, "items": projected})
+    unread_count = sum(1 for n in projected if not n["isRead"])
+
+    return jsonify(
+        {
+            "ok": True,
+            "items": projected,
+            "unreadCount": unread_count,
+        }
+    )
+
 
 @bp.post("/notifications/mark-all-read")
 @require_role("buyers", "sellers", "admin")
@@ -819,3 +1073,159 @@ def get_my_bids():
     results.sort(key=lambda b: b.get("createdAt") or "", reverse=True)
 
     return jsonify({"items": results})
+
+# at the top of buyer_routes.py (if not already there)
+import urllib.parse
+
+# ...
+
+@bp.get("/listings/<path:listing_id>")
+@require_role("buyers", "admin")
+def get_listing_details(listing_id: str):
+    """
+    Return full details for a single listing for the buyer details page.
+    Accepts a URL-encoded listing_id (LISTREQ%23USER%23002%2317642...)
+    and decodes it back to the DynamoDB PK (LISTREQ#USER#002#1764237088).
+    """
+    listing_id = urllib.parse.unquote(listing_id)
+    current_app.logger.info("Buyer requesting listing details for %s", listing_id)
+
+    table = current_app.ddb_table
+
+    # Try LISTING first, then LISTING_REQUEST (your existing patterns)
+    item = None
+    for key in (
+        {"PK": listing_id, "SK": "LISTING"},
+        {"PK": listing_id, "SK": "LISTING_REQUEST"},
+    ):
+        resp = table.get_item(Key=key)
+        item = resp.get("Item")
+        if item:
+            current_app.logger.info(
+                "Listing %s found in DynamoDB with key %s", listing_id, key
+            )
+            break
+
+    if not item:
+        current_app.logger.warning("Listing %s not found in DynamoDB", listing_id)
+        return jsonify({"error": "Listing not found"}), 404
+
+    # --- Convert raw S3 keys in Photos → presigned HTTPS URLs ---
+    photos_raw = item.get("Photos") or {}
+    photos_signed: dict[str, str] = {}
+
+    if isinstance(photos_raw, dict):
+        for label, key in photos_raw.items():
+            if not key:
+                continue
+            try:
+                url = presign_get(key)
+                photos_signed[str(label)] = url
+            except Exception as exc:
+                current_app.logger.warning(
+                    "Failed to presign photo %r (%s): %s", label, key, exc
+                )
+    else:
+        photos_signed = photos_raw  # legacy shape – just pass through
+
+    # Helper to convert Decimal → float
+    def _num(v):
+        if isinstance(v, Decimal):
+            return float(v)
+        return v
+
+    # ---- Load device PROFILE row for release + platform range ----
+    device_pk = item.get("DevicePK")
+    device_profile: dict | None = None
+    if device_pk:
+        try:
+            resp = table.get_item(Key={"PK": device_pk, "SK": "PROFILE"})
+            device_profile = resp.get("Item") or None
+        except Exception as exc:
+            current_app.logger.warning("Failed to load device profile %s: %s", device_pk, exc)
+
+    final_grade = item.get("FinalGrade")
+
+    # Release metadata – prefer PROFILE, fall back to listing
+    release_date = None
+    release_price = None
+    if device_profile:
+        release_date = device_profile.get("ReleaseDate")
+        release_price = device_profile.get("ReleasePrice")
+    release_date = release_date or item.get("ReleaseDate") or item.get("releaseDate")
+    release_price = release_price or item.get("ReleasePrice")
+
+    # ---- Platform range (for this device / grade) ----
+    platform_min = None
+    platform_max = None
+
+    if device_profile and final_grade:
+        g = str(final_grade).upper()
+        if g == "A":
+            platform_min = device_profile.get("Grade_A_MIN")
+            platform_max = device_profile.get("Grade_A_MAX")
+        elif g == "B":
+            platform_min = device_profile.get("Grade_B_MIN")
+            platform_max = device_profile.get("Grade_B_MAX")
+        elif g == "C":
+            platform_min = device_profile.get("Grade_C_MIN")
+            platform_max = device_profile.get("Grade_C_MAX")
+
+    # Fallback: if we still have nothing, try any generic grade min/max on listing
+    if platform_min is None and platform_max is None:
+        platform_min = item.get("GradeMinPrice")
+        platform_max = item.get("GradeMaxPrice")
+
+    platform_range = None
+    if platform_min is not None or platform_max is not None:
+        platform_range = {
+            "min": _num(platform_min),
+            "max": _num(platform_max),
+        }
+
+    # ---- Device info for frontend ----
+    device = {
+        "brand": item.get("Brand", ""),
+        "category": item.get("Category", ""),
+        "model": item.get("Model", ""),
+        "variant": item.get("Variant"),
+        "ram": item.get("RAM"),
+        "storage": item.get("Storage"),
+        "grade": final_grade,
+        "photos": photos_signed,
+        "title": item.get("Title", ""),
+        "devicePk": device_pk,
+        "releaseDate": release_date,
+        "releasePrice": _num(release_price) if release_price is not None else None,
+    }
+
+    # ---- Auction info ----
+    auction = {
+        "auctionMode": item.get("AuctionMode", "continuous"),
+        "status": item.get("Status", "active"),
+        "startsAt": item.get("AuctionStartsAt"),
+        "endsAt": item.get("AuctionEndsAt"),
+        "sellerMin": _num(item.get("SellerMin", 0)),
+        "sellerMax": _num(item.get("SellerMax", 0)),
+        # Kept for future use, but not displayed in UI now
+        "currentTradePrice": _num(item.get("CurrentTradePrice")),
+        "finalMin": _num(item.get("FinalMin")),
+        "finalMax": _num(item.get("FinalMax")),
+    }
+
+    questionnaire = item.get("Questionnaire")
+    market_key = item.get("MarketKey", "")
+
+    return jsonify(
+        {
+            "ok": True,
+            "listingId": listing_id,
+            "marketKey": market_key,
+            "device": device,
+            "auction": auction,
+            "platformRange": platform_range,
+            "questionnaire": questionnaire,
+        }
+    )
+
+
