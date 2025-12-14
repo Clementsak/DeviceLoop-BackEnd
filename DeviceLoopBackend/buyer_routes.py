@@ -11,11 +11,14 @@ import os
 from boto3.dynamodb.conditions import Attr, Key
 from .s3_utils import presign_get
 import urllib.parse
+from botocore.exceptions import ClientError
 
 from .guards import require_role
 from .auth_routes import _find_user_pk_by_sub, _profile_key
 
 bp = Blueprint("buyer", __name__, url_prefix="/buyer")
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+sns_client = boto3.client("sns") if SNS_TOPIC_ARN else None
 
 now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -835,16 +838,19 @@ def get_unread_notifications_count():
         ScanIndexForward=False,
     )
     items = resp.get("Items", [])
-    unread = sum(1 for it in items if not it.get("Read"))
+    unread = sum(1 for it in items if not bool(it.get("Read", it.get("Read", False))))
 
     return jsonify({"ok": True, "count": unread})
+
+
 
 @bp.get("/notifications")
 @require_role("buyers", "sellers", "admin")
 def list_notifications():
     """
     Return notifications for the current user in the shape expected by the
-    React NotificationsPage (id, type, title, message, createdAt, isRead).
+    React NotificationsPage:
+      { id, type, title, message, createdAt, isRead }
     """
     user_pk = _user_pk_from_session()
     if not user_pk:
@@ -858,7 +864,7 @@ def list_notifications():
         ScanIndexForward=False,  # newest first
         Limit=int(request.args.get("limit", 100)),
     )
-    items = resp.get("Items", [])
+    items = resp.get("Items", []) or []
 
     def _format_rm(value):
         try:
@@ -866,45 +872,106 @@ def list_notifications():
         except Exception:
             return "the agreed price"
 
+    def _canon_type(raw_type: str | None) -> str:
+        """
+        Canonicalize legacy / mixed notification type values.
+        """
+        if not raw_type:
+            return "SYSTEM"
+
+        t = str(raw_type).strip()
+
+        # Allow both lowercase and uppercase legacy values
+        upper = t.upper()
+
+        # Map legacy names to canonical names
+        legacy_map = {
+            "TRADE_FILLED": "TRADE_MATCHED",
+            "TRADE_MATCHED": "TRADE_MATCHED",
+            "BID_EXPIRED": "BID_EXPIRED",
+            "LISTING_EXPIRED_NO_MATCH": "LISTING_EXPIRED_NO_MATCH",
+            "PAYMENT_COMPLETED": "PAYMENT_COMPLETED",
+            "PAYMENT_COMPLETED ": "PAYMENT_COMPLETED",
+            "PAYMENT": "PAYMENT_COMPLETED",
+            "PAYMENT_COMPLETED#BUYER": "PAYMENT_COMPLETED",
+            "PAYMENT_COMPLETED#SELLER": "PAYMENT_COMPLETED",
+            "PAYMENT_COMPLETED_EVENT": "PAYMENT_COMPLETED",
+            "PAYMENT_COMPLETED_NOTIFICATION": "PAYMENT_COMPLETED",
+            "PAYMENT_COMPLETED_NOTIF": "PAYMENT_COMPLETED",
+            "PAYMENT_COMPLETED.": "PAYMENT_COMPLETED",
+
+            # If you previously stored lowercase:
+            "PAYMENT_COMPLETED".lower(): "PAYMENT_COMPLETED",
+            "payment_completed": "PAYMENT_COMPLETED",
+
+            # If you previously stored "trade_filled" lowercase:
+            "trade_filled": "TRADE_MATCHED",
+        }
+
+        return legacy_map.get(t, legacy_map.get(upper, upper if upper else "SYSTEM"))
+
     projected: list[dict] = []
 
     for raw in items:
-        notif_type = raw.get("Type") or "generic"
-        user_role = raw.get("UserRole") or "buyer"
+        notif_type = _canon_type(raw.get("Type") or raw.get("type"))
+        user_role = (raw.get("UserRole") or raw.get("Role") or "buyer").lower()
         market_key = raw.get("MarketKey") or ""
         trade_price = raw.get("TradePrice")
-        created_at = raw.get("CreatedAt")
+        created_at = raw.get("CreatedAt") or raw.get("PaidAt") or raw.get("MatchedAt") or raw.get("EndedAt") or ""
+
+        # Standardize read flag
         is_read = bool(raw.get("Read", False))
 
-        # --- Build human friendly title + message ---------------------------
-        if notif_type == "trade_filled":
-            price_str = _format_rm(trade_price)
+        message_from_item = raw.get("Message")
 
+        # Titles + messages
+        if notif_type == "TRADE_MATCHED":
+            price_str = _format_rm(trade_price)
             if user_role == "buyer":
                 title = "Your bid has been matched"
-                message = (
+                message = message_from_item or (
                     f"Your bid in market {market_key} has been matched at {price_str}. "
                     "Please proceed to checkout to complete the purchase."
                 )
             elif user_role == "seller":
                 title = "Your listing has been matched with a buyer"
-                message = (
-                    f"Your listing in market {market_key} has been matched with a buyer "
-                    f"at {price_str}. Check your seller dashboard for the trade details."
+                message = message_from_item or (
+                    f"Your listing in market {market_key} has been matched with a buyer at {price_str}. "
+                    "Check your seller dashboard for the trade details."
                 )
             else:
                 title = "Trade matched"
-                message = (
-                    f"A trade in market {market_key} was matched at {price_str}."
+                message = message_from_item or f"A trade in market {market_key} was matched at {price_str}."
+
+        elif notif_type == "BID_EXPIRED":
+            title = "Bid expired"
+            message = message_from_item or f"Your bid in market {market_key} has expired."
+
+        elif notif_type == "LISTING_EXPIRED_NO_MATCH":
+            title = "Listing expired without match"
+            message = message_from_item or f"Your listing in market {market_key} expired without any matching bid."
+
+        elif notif_type == "PAYMENT_COMPLETED":
+            price_str = _format_rm(trade_price)
+            if user_role == "seller":
+                title = "Payment received"
+                message = message_from_item or (
+                    f"The buyer has completed payment for your listing in market {market_key} at {price_str}. "
+                    "You may now proceed with settlement."
                 )
+            else:
+                title = "Payment successful"
+                message = message_from_item or (
+                    f"Your payment for market {market_key} has been recorded at {price_str}. "
+                    "Thank you for completing your purchase."
+                )
+
         else:
-            # Fallback for any other notification types
             title = "Update on your bids and listings"
-            message = "You have a new notification in DeviceLoop."
+            message = message_from_item or "You have a new notification in DeviceLoop."
 
         projected.append(
             {
-                # Simple identifier for React – we just use SK
                 "id": raw.get("SK"),
                 "type": notif_type,
                 "title": title,
@@ -915,14 +982,8 @@ def list_notifications():
         )
 
     unread_count = sum(1 for n in projected if not n["isRead"])
+    return jsonify({"ok": True, "items": projected, "unreadCount": unread_count})
 
-    return jsonify(
-        {
-            "ok": True,
-            "items": projected,
-            "unreadCount": unread_count,
-        }
-    )
 
 
 @bp.post("/notifications/mark-all-read")
@@ -954,6 +1015,7 @@ def mark_all_notifications_read():
         )
 
     return jsonify({"ok": True})
+
 
 @bp.get("/my-bids")
 @require_role("buyers", "admin")
@@ -1284,4 +1346,360 @@ def get_listing_details(listing_id: str):
         }
     )
 
+@bp.get("/purchases")
+@require_role("buyers", "admin")
+def get_purchases():
+    """
+    Return all listings where the current user is the matched buyer.
+    Used by the buyer cart page.
+    """
+    buyer_pk = _buyer_pk_from_session()
+    if not buyer_pk:
+        return ("Unauthorized", 401)
 
+    table = current_app.ddb_table
+
+    # All LISTING_REQUEST rows where this buyer was matched
+    resp = table.scan(
+        FilterExpression=Attr("SK").eq("LISTING_REQUEST")
+        & Attr("MatchedBuyerPK").eq(buyer_pk)
+    )
+    items = resp.get("Items", [])
+
+    def _infer_seller_pk_from_listing_pk(listing_pk: str | None) -> str | None:
+        """
+        listing_pk often looks like:
+          LISTREQ#USER#002#17565668374
+        If SellerPK isn't stored, infer seller as USER#002.
+        """
+        if not listing_pk or not isinstance(listing_pk, str):
+            return None
+        if not listing_pk.startswith("LISTREQ#"):
+            return None
+        rest = listing_pk[len("LISTREQ#"):]
+        parts = rest.split("#")
+        # USER#002#<timestamp>  -> USER#002
+        if len(parts) >= 2:
+            return "#".join(parts[:2])
+        return parts[0] if parts else None
+
+    def _infer_grade(market_key: str | None, fallback: str | None) -> str | None:
+        if fallback:
+            return fallback
+        if not market_key:
+            return None
+        # e.g. Device#079#A  -> A
+        try:
+            g = str(market_key).split("#")[-1]
+            return g if g else None
+        except Exception:
+            return None
+
+    results: list[dict] = []
+    for it in items:
+        listing_pk = it.get("PK")
+        market_key = it.get("MarketKey")
+
+        matched_at = (
+            it.get("MatchedAt")
+            or it.get("EndedAt")
+            or it.get("AuctionEndsAt")
+        )
+
+        # Prefer CurrentTradePrice (interval/end-of-window), then MatchedTradePrice (continuous), then TradePrice
+        raw_trade_price = (
+            it.get("CurrentTradePrice")
+            or it.get("MatchedTradePrice")
+            or it.get("TradePrice")
+            or 0
+        )
+        try:
+            trade_price = float(raw_trade_price)
+        except (TypeError, ValueError):
+            trade_price = 0.0
+
+        payment_status = it.get("PaymentStatus", "pending")
+        paid_at = it.get("PaidAt")
+
+        seller_pk = (
+            it.get("SellerPK")
+            or it.get("SellerPk")
+            or _infer_seller_pk_from_listing_pk(listing_pk)
+        )
+
+        auction_mode = (
+            it.get("AuctionMode")
+            or it.get("auctionMode")
+            or it.get("Mode")
+            # For older rows that didn't store it, pick a sensible default
+            or "continuous"
+        )
+
+        brand = it.get("Brand") or it.get("DeviceBrand")
+        model = it.get("Model") or it.get("DeviceModel")
+        variant = it.get("Variant") or it.get("DeviceVariant")
+        grade = _infer_grade(
+            market_key,
+            it.get("FinalGrade") or it.get("InitialGrade") or it.get("Grade")
+        )
+
+        results.append(
+            {
+                "listingId": listing_pk,
+                "marketKey": market_key,
+                "brand": brand,
+                "model": model,
+                "variant": variant,
+                "grade": grade,
+                "sellerPk": seller_pk,
+                "auctionMode": auction_mode,
+                "matchedAt": matched_at,
+                "tradePrice": trade_price,
+                "paymentStatus": payment_status,
+                "paidAt": paid_at,
+                "status": it.get("ListingStatus") or it.get("Status"),
+            }
+        )
+
+    return jsonify({"ok": True, "items": results})
+
+
+@bp.post("/purchases/<listing_id>/pay")
+@require_role("buyers", "admin")
+def pay_for_purchase(listing_id: str):
+    """
+    Mark a matched listing as paid by the current buyer and
+    create payment notifications for BOTH buyer and seller.
+    """
+    buyer_pk = _buyer_pk_from_session()
+    if not buyer_pk:
+        return ("Unauthorized", 401)
+
+    table = current_app.ddb_table
+
+    listing_pk = listing_id
+    listing_sk = "LISTING_REQUEST"
+
+    now = datetime.now(timezone.utc)
+    paid_at_iso = now.isoformat()
+
+    try:
+        # 1) Mark listing as paid (only if it was already matched and not paid)
+        table.update_item(
+            Key={"PK": listing_pk, "SK": listing_sk},
+            UpdateExpression="""
+                SET PaymentStatus = :paid,
+                    PaidAt = :paidAt
+            """,
+            ExpressionAttributeValues={
+                ":paid": "paid",
+                ":paidAt": paid_at_iso,
+            },
+            ConditionExpression=Attr("MatchedBuyerPK").eq(buyer_pk)
+            & (Attr("PaymentStatus").ne("paid") | Attr("PaymentStatus").not_exists()),
+        )
+
+        # 2) Reload listing to include all metadata for the response + notifications
+        listing_resp = table.get_item(Key={"PK": listing_pk, "SK": listing_sk})
+        listing = listing_resp.get("Item")
+        if not listing:
+            current_app.logger.error(
+                "Listing not found after payment update: %s", listing_pk
+            )
+            return jsonify({"ok": False, "error": "Listing not found"}), 404
+
+        # Compute trade price again (for notifications)
+        raw_trade_price = (
+            listing.get("CurrentTradePrice")
+            or listing.get("MatchedTradePrice")
+            or listing.get("TradePrice")
+            or 0
+        )
+        try:
+            trade_price_num = float(raw_trade_price)
+        except (TypeError, ValueError):
+            trade_price_num = 0.0
+
+        # 3) Create payment notifications for buyer + seller
+        market_key = listing.get("MarketKey")
+        brand = listing.get("Brand")
+        model = listing.get("Model")
+        variant = listing.get("Variant")
+        seller_pk = listing.get("SellerPK")
+        listing_status = listing.get("ListingStatus") or listing.get("Status") or "ended"
+
+        # Store price in Dynamo as Decimal
+        trade_price_d = Decimal(str(trade_price_num)) if trade_price_num else Decimal("0")
+
+        # Common base for notifications
+        def make_notif(pk: str, role: str, suffix: str) -> dict:
+            return {
+                "PK": f"NOTIF#{pk}",
+                "SK": f"TS#{paid_at_iso}#PAYMENT#{suffix}",
+                "Type": "PAYMENT_COMPLETED",
+                "UserPK": pk,
+                "UserRole": role,
+                "MarketKey": market_key,
+                "Brand": brand,
+                "Model": model,
+                "Variant": variant,
+                "TradePrice": trade_price_d,
+                "ListingPK": listing_pk,
+                "ListingStatus": listing_status,
+                "PaymentStatus": "paid",
+                "PaidAt": paid_at_iso,
+                "CreatedAt": paid_at_iso,
+                "Read": False,
+            }
+
+        # Buyer notification
+        buyer_notif = make_notif(buyer_pk, "buyer", "BUYER")
+        table.put_item(Item=buyer_notif)
+
+        # Seller notification (if we know the seller)
+        if seller_pk:
+            seller_notif = make_notif(seller_pk, "seller", "SELLER")
+            table.put_item(Item=seller_notif)
+
+        # 4) Response for the frontend
+        return jsonify(
+            {
+                "ok": True,
+                "listingId": listing_pk,
+                "paidAt": paid_at_iso,
+            }
+        )
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            current_app.logger.error(
+                "Failed conditional payment update for listing %s / buyer %s",
+                listing_pk,
+                buyer_pk,
+            )
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "cannot mark as paid",
+                    }
+                ),
+                400,
+            )
+
+        current_app.logger.exception("Failed to mark purchase as paid")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "failed to mark as paid",
+                }
+            ),
+            500,
+        )
+
+
+from datetime import datetime, timezone
+
+def _create_payment_notifications(table, listing_item: dict, buyer_pk: str, seller_pk: str) -> None:
+    """
+    Create 'payment_completed' notifications for both buyer and seller.
+
+    table       - DynamoDB table resource
+    listing_item- the listing item as stored in DynamoDB
+    buyer_pk    - PK of the buyer profile (e.g. PROFILE#<sub>)
+    seller_pk   - PK of the seller profile
+    """
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    trade_price = (
+        listing_item.get("MatchedTradePrice")
+        or listing_item.get("CurrentTradePrice")
+        or 0
+    )
+
+    base_payload = {
+        "Type": "payment_completed",
+        "ListingPK": listing_item.get("PK"),
+        "DevicePK": listing_item.get("DevicePK"),
+        "MarketKey": listing_item.get("MarketKey"),
+        "TradePrice": float(trade_price),
+        "AuctionMode": listing_item.get("AuctionMode", "continuous"),
+        "CreatedAt": now,
+        "Read": False,
+    }
+
+    # Buyer notification
+    if buyer_pk:
+        table.put_item(
+            Item={
+                "PK": f"NOTIF#{buyer_pk}",
+                "SK": f"TS#{now}#PAYMENT#BUYER",
+                "UserRole": "buyer",
+                **base_payload,
+            }
+        )
+
+    # Seller notification
+    if seller_pk:
+        table.put_item(
+            Item={
+                "PK": f"NOTIF#{seller_pk}",
+                "SK": f"TS#{now}#PAYMENT#SELLER",
+                "UserRole": "seller",
+                **base_payload,
+            }
+        )
+
+@bp.post("/notifications/mark-read")
+@require_role("buyers", "sellers", "admin")
+def mark_notifications_read():
+    """
+    Mark notifications as read.
+    If ids is missing or empty, mark the latest batch as read (same behavior as mark-all-read).
+    """
+    user_pk = _user_pk_from_session()
+    if not user_pk:
+        return ("Unauthorized", 401)
+
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids") or []
+
+    table = current_app.ddb_table
+    notif_pk = f"NOTIF#{user_pk}"
+    now_iso = _utc_now_iso()
+
+    # If no ids provided: reuse your existing logic (mark latest 50 as read)
+    if not ids:
+        resp = table.query(
+            KeyConditionExpression=Key("PK").eq(notif_pk),
+            Limit=50,
+            ScanIndexForward=False,
+        )
+        items = resp.get("Items", [])
+        for it in items:
+            if it.get("Read"):
+                continue
+            table.update_item(
+                Key={"PK": it["PK"], "SK": it["SK"]},
+                UpdateExpression="SET #read = :true, ReadAt = :now",
+                ExpressionAttributeNames={"#read": "Read"},
+                ExpressionAttributeValues={":true": True, ":now": now_iso},
+            )
+        return jsonify({"ok": True, "count": len(items)})
+
+    # If ids provided: ids are the SK values from the notification list
+    updated = 0
+    for sk in ids:
+        try:
+            table.update_item(
+                Key={"PK": notif_pk, "SK": sk},
+                UpdateExpression="SET #read = :true, ReadAt = :now",
+                ExpressionAttributeNames={"#read": "Read"},
+                ExpressionAttributeValues={":true": True, ":now": now_iso},
+            )
+            updated += 1
+        except Exception:
+            current_app.logger.exception("Failed to mark notification read")
+    return jsonify({"ok": True, "count": updated})
