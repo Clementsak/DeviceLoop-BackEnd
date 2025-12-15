@@ -1,14 +1,13 @@
-﻿import json
-import os
+﻿import os
+import json
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
-from boto3.dynamodb.conditions import Attr, Key
+from boto3.dynamodb.conditions import Attr
 
-# --- Setup ---
-
-AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")  # provided by Lambda automatically
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 DDB_TABLE_NAME = os.environ["DDB_TABLE_NAME"]
 
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
@@ -17,574 +16,685 @@ table = dynamodb.Table(DDB_TABLE_NAME)
 sns = boto3.client("sns")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
 
-# This will be populated for each invocation so logs from the same run can be grouped.
-CURRENT_REQUEST_ID: str | None = None
+# Optional per-role topics (fall back to SNS_TOPIC_ARN if not provided)
+NOTIFY_BUYER_SNS_ARN = os.environ.get("NOTIFY_BUYER_SNS_ARN") or SNS_TOPIC_ARN
+NOTIFY_SELLER_SNS_ARN = os.environ.get("NOTIFY_SELLER_SNS_ARN") or SNS_TOPIC_ARN
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-def serialize_decimals(obj):
-    if isinstance(obj, list):
-        return [serialize_decimals(x) for x in obj]
-    if isinstance(obj, dict):
-        return {k: serialize_decimals(v) for k, v in obj.items()}
-    if isinstance(obj, Decimal):
-        return float(obj)
-    return obj
+EMAIL_FROM = os.environ["EMAIL_FROM"]
+ses = boto3.client("ses", region_name=AWS_REGION)
 
+def ddb_get_user_email(user_pk: str | None) -> str | None:
+    if not user_pk:
+        return None
+    resp = table.get_item(Key={"PK": user_pk, "SK": "PROFILE"})
+    item = resp.get("Item") or {}
+    return item.get("Email")
 
-def log(level: str, message: str, **kwargs) -> None:
-    """
-    Small helper to emit structured JSON logs so you can clearly see
-    what path was taken for each SQS message.
-
-    Usage:
-        log("info", "Handling NEW_BID", marketKey=..., bidPk=...)
-    """
-    entry = {
-        "level": level,
-        "time": datetime.now(timezone.utc).isoformat(),
-        "message": message,
-    }
-    if CURRENT_REQUEST_ID:
-        entry["requestId"] = CURRENT_REQUEST_ID
-    if kwargs:
-        entry["details"] = serialize_decimals(kwargs)
-
-    # CloudWatch still just sees a normal log line, but now it is structured JSON.
-    print(json.dumps(entry, default=str))
+def send_email(to_addr: str | None, subject: str, body: str) -> None:
+    if not to_addr:
+        logger.info("[EMAIL] skip: no recipient (subject=%s)", subject)
+        return
+    try:
+        resp = ses.send_email(
+            Source=EMAIL_FROM,
+            Destination={"ToAddresses": [to_addr]},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
+            },
+        )
+        logger.info(
+            "[EMAIL] sent ok to=%s subject=%s messageId=%s",
+            to_addr,
+            subject,
+            resp.get("MessageId"),
+        )
+    except Exception as e:
+        # Never break matching/clearing because email failed
+        logger.exception("Email send failed: %s", e)
 
 
 def lambda_handler(event, context):
-    """
-    Entry point for Amazon Simple Queue Service triggered Lambda.
-    For each Amazon Simple Queue Service record, we expect a JSON body like:
+    now = datetime.now(timezone.utc)
+    logger.info("[CLEARING] Running batch matching at %s", now.isoformat())
 
-      {
-        "type": "NEW_BID",
-        "marketKey": "...",
-        "bidPk": "MARKET#...",
-        "bidSk": "BID#...",
-        "auctionMode": "continuous" | "interval" | "end_of_window"
-      }
+    # 1) Load all open, unexpired bids
+    open_bids = load_open_bids(now)
+    logger.info("[CLEARING] Loaded %d open bids", len(open_bids))
 
-    or
-
-      {
-        "type": "NEW_LISTING",
-        "marketKey": "...",
-        "listingId": "LISTREQ#SELLER#..."
-      }
-    """
-    global CURRENT_REQUEST_ID
-    CURRENT_REQUEST_ID = getattr(context, "aws_request_id", None)
-
-    log(
-        "info",
-        "Received SQS batch",
-        recordCount=len(event.get("Records", [])),
+    # 2) Load all active listings that should be cleared now (interval + end_of_window)
+    listings_interval, listings_eow = load_active_listings_to_clear(now)
+    logger.info(
+        "[CLEARING] Listings to clear: %d interval, %d end_of_window",
+        len(listings_interval),
+        len(listings_eow),
     )
 
-    for idx, record in enumerate(event.get("Records", [])):
-        body = record.get("body")
-        if not body:
-            log("warning", "Record had no body, skipping", recordIndex=idx)
-            continue
+    # 3) Group by market and mode
+    markets: dict[str, dict[str, dict[str, list]]] = {}
 
-        try:
-            msg = json.loads(body)
-        except json.JSONDecodeError:
-            log("warning", "Skipping non-JSON message", recordIndex=idx, body=body)
-            continue
+    def ensure_market(mk: str):
+        if mk not in markets:
+            markets[mk] = {
+                "interval": {"asks": [], "bids": []},
+                "end_of_window": {"asks": [], "bids": []},
+            }
+        return markets[mk]
 
-        msg_type = msg.get("type")
-        if msg_type == "NEW_BID":
-            log("info", "Dispatching NEW_BID message", recordIndex=idx, **msg)
-            handle_new_bid_message(msg)
-        elif msg_type == "NEW_LISTING":
-            log("info", "Dispatching NEW_LISTING message", recordIndex=idx, **msg)
-            handle_new_listing_message(msg)
-        else:
-            log("warning", "Unknown message type", recordIndex=idx, msgType=msg_type, body=msg)
+    # Add asks
+    for listing in listings_interval:
+        mk = listing.get("MarketKey")
+        if not mk:
+            continue
+        m = ensure_market(mk)
+        m["interval"]["asks"].append(listing)
+
+    for listing in listings_eow:
+        mk = listing.get("MarketKey")
+        if not mk:
+            continue
+        m = ensure_market(mk)
+        m["end_of_window"]["asks"].append(listing)
+
+    # Add bids to both modes (an open bid can match interval or end_of_window)
+    for bid in open_bids:
+        mk = bid.get("MarketKey")
+        if not mk:
+            continue
+        m = ensure_market(mk)
+        m["interval"]["bids"].append(bid)
+        m["end_of_window"]["bids"].append(bid)
+
+    # 4) Run double-auction matching per (market, mode)
+    for mk, modes in markets.items():
+        for mode_name, book in modes.items():
+            asks = book["asks"]
+            bids = book["bids"]
+
+            # Helpful visibility: end_of_window should have asks after end time
+            logger.info(
+                "[CLEARING] Book market=%s mode=%s asks=%d bids=%d",
+                mk,
+                mode_name,
+                len(asks),
+                len(bids),
+            )
+
+            if not asks or not bids:
+                # If end_of_window has asks but no bids, we still want run_double_auction_for_market()
+                # to expire asks with notifications. But your current function expects bids too.
+                # We'll handle "no bids" by calling it anyway (it will expire through no-cross path).
+                if mode_name == "end_of_window" and asks and not bids:
+                    run_double_auction_for_market(mk, mode_name, asks, bids, now)
+                continue
+
+            run_double_auction_for_market(mk, mode_name, asks, bids, now)
+
+    logger.info("[CLEARING] Done matching step.")
+
+    # Cleanup for continuous listings and stale bids (interval and end_of_window are not expired here)
+    expire_stale_bids_and_listings(table, now, logger)
 
     return {"ok": True}
 
-def handle_new_bid_message(msg: dict) -> None:
+
+def parse_iso_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    s = value.strip()
+    # Convert "...Z" into a valid ISO-8601 offset for fromisoformat
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    dt = datetime.fromisoformat(s)
+
+    # If no timezone info, assume UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
+
+
+
+def expire_stale_bids_and_listings(table, now: datetime, logger):
     """
-    Handle a NEW_BID message from the backend.
+    Expire listings + bids for ALL auction modes, including continuous.
 
-    We fully implement the continuous mode:
-    - Load the bid
-    - Check status and expiry
-    - If auctionMode == 'continuous', try to match it immediately
+    Important:
+    - Interval and end_of_window listings must NOT be expired here.
+      They must be handled by the clearing logic (double auction step).
     """
-    market_key = msg.get("marketKey")
-    bid_pk = msg.get("bidPk")
-    bid_sk = msg.get("bidSk")
-    auction_mode = msg.get("auctionMode") or "continuous"
+    now_iso = now.isoformat()
 
-    log(
-        "info",
-        "[NEW_BID] Handling bid message",
-        marketKey=market_key,
-        bidPk=bid_pk,
-        bidSk=bid_sk,
-        auctionMode=auction_mode,
-    )
-
-    if not bid_pk or not bid_sk:
-        log("error", "Missing bidPk or bidSk in message, skipping", message=msg)
-        return
-
-    # 1) Load the bid item from DynamoDB
-    bid_resp = table.get_item(Key={"PK": bid_pk, "SK": bid_sk})
-    bid = bid_resp.get("Item")
-    if not bid:
-        log("warning", "Bid item not found in DynamoDB, maybe already deleted", bidPk=bid_pk, bidSk=bid_sk)
-        return
-
-    now = datetime.now(timezone.utc)
-
-    # Status and expiry check
-    status = bid.get("BidStatus", "open")
-    if status != "open":
-        log("info", "Bid is not open, skipping", bidStatus=status, bidPk=bid_pk, bidSk=bid_sk)
-        return
-
-    expires_at_str = bid.get("BidExpiresAt")
-    if expires_at_str:
-        try:
-            expires_at = datetime.fromisoformat(expires_at_str)
-            if now >= expires_at:
-                log("info", "Bid already expired, marking as expired", bidPk=bid_pk, bidSk=bid_sk)
-                table.update_item(
-                    Key={"PK": bid_pk, "SK": bid_sk},
-                    UpdateExpression="SET BidStatus = :s",
-                    ExpressionAttributeValues={":s": "expired"},
-                )
-                return
-        except ValueError:
-            log("warning", "Could not parse BidExpiresAt", rawValue=expires_at_str, bidPk=bid_pk, bidSk=bid_sk)
-
-    # Only continuous mode does immediate matching here.
-    if auction_mode != "continuous":
-        log(
-            "info",
-            "Auction mode is not continuous; skipping matching in this Lambda",
-            auctionMode=auction_mode,
-        )
-        return
-
+    # EXPIRE LISTINGS (continuous only)
     try:
-        bid_price = float(bid["BidPrice"])
-    except (KeyError, TypeError, ValueError):
-        log("error", "Bid has invalid BidPrice, skipping", bidPk=bid_pk, bidSk=bid_sk, rawPrice=bid.get("BidPrice"))
-        return
+        resp = table.scan(FilterExpression=Attr("SK").eq("LISTING_REQUEST"))
+        expired_listings = 0
 
-    buyer_pk = bid.get("BuyerPK")
-    log("info", "Attempting continuous match for bid", buyerPk=buyer_pk, bidPrice=bid_price, marketKey=market_key)
+        for item in resp.get("Items", []):
+            status = item.get("Status") or item.get("status") or "active"
+            mode = item.get("AuctionMode")
 
-    # 2) Load active sellers for this marketKey.
+            # Do NOT expire interval or end-of-window listings here.
+            if mode in ("interval", "end_of_window"):
+                continue
+
+            if status != "active":
+                continue
+
+            ends_at = parse_iso_utc(item.get("AuctionEndsAt"))
+            if not ends_at or ends_at > now:
+                continue
+
+            table.update_item(
+                Key={"PK": item["PK"], "SK": item["SK"]},
+                UpdateExpression="""
+                    SET #s = :expired,
+                        EndReason = :reason,
+                        EndedAt = :endedAt
+                """,
+                ExpressionAttributeNames={"#s": "Status"},
+                ExpressionAttributeValues={
+                    ":expired": "expired",
+                    ":reason": "expired_no_match",
+                    ":endedAt": now_iso,
+                },
+            )
+            expired_listings += 1
+
+            seller_pk = item.get("SellerPK")
+            market_key = item.get("MarketKey") or ""
+
+            if seller_pk:
+                message = (
+                    f"Your listing {item.get('PK')} in market {market_key} "
+                    f"expired without any matching bid."
+                )
+                write_user_notification(
+                    table=table,
+                    user_pk=seller_pk,
+                    notif_type="LISTING_EXPIRED_NO_MATCH",
+                    message=message,
+                )
+
+            # --- DROP-IN: email for continuous listing expiry (no match) ---
+            if seller_pk:
+                seller_email = ddb_get_user_email(seller_pk)
+                logger.info("[EMAIL] listing_expired_no_match seller_pk=%s seller_email=%s", seller_pk, seller_email)
+                send_email(
+                    seller_email,
+                    "DeviceLoop listing expired without match",
+                    (
+                        f"Your listing expired without any matching bid.\n\n"
+                        f"Listing: {item.get('PK')}\n"
+                        f"Market: {market_key}\n"
+                        f"Mode: continuous\n"
+                        f"Ended at: {now_iso}\n"
+                    ),
+                )
+
+            if SNS_TOPIC_ARN and seller_pk:
+                payload = {
+                    "type": "LISTING_EXPIRED_NO_MATCH",
+                    "sellerPk": seller_pk,
+                    "marketKey": market_key,
+                    "listingPk": item.get("PK"),
+                    "listingSk": item.get("SK"),
+                    "endedAt": now_iso,
+                }
+                sns.publish(
+                    TopicArn=SNS_TOPIC_ARN,
+                    Subject="DeviceLoop listing expired with no match",
+                    Message=json.dumps(payload),
+                )
+
+        if expired_listings:
+            logger.info("[CLEANUP] Expired %d continuous listings", expired_listings)
+
+    except Exception:
+        logger.exception("[CLEANUP] Error while scanning for listings")
+
+
+def load_open_bids(now: datetime) -> list[dict]:
+    """
+    Load all BID items with BidStatus='open'.
+    Expire bids that passed BidExpiresAt, and write BID_EXPIRED notifications.
+    """
+    resp = table.scan(
+        FilterExpression=Attr("SK").begins_with("BID") & Attr("BidStatus").eq("open")
+    )
+    items = resp.get("Items", []) or []
+
+    open_bids: list[dict] = []
+
+    for bid in items:
+        expires_at_str = bid.get("BidExpiresAt")
+        expires_at = None
+
+        if expires_at_str:
+            try:
+                expires_at = parse_iso_utc(expires_at_str)
+            except Exception:
+                expires_at = None
+
+        if expires_at and expires_at <= now:
+            table.update_item(
+                Key={"PK": bid["PK"], "SK": bid["SK"]},
+                UpdateExpression="""
+                    SET BidStatus = :expired,
+                        ClosedReason = :reason,
+                        ClosedAt = :closedAt
+                """,
+                ExpressionAttributeValues={
+                    ":expired": "expired",
+                    ":reason": "expired_timeout",
+                    ":closedAt": now.isoformat(),
+                },
+            )
+
+            buyer_pk = bid.get("BuyerPK")
+
+            if SNS_TOPIC_ARN and buyer_pk:
+                payload = {
+                    "type": "BID_EXPIRED",
+                    "buyerPk": buyer_pk,
+                    "marketKey": bid.get("MarketKey"),
+                    "bidPk": bid.get("PK"),
+                    "bidSk": bid.get("SK"),
+                    "expiresAt": expires_at_str,
+                }
+                sns.publish(
+                    TopicArn=SNS_TOPIC_ARN,
+                    Subject="DeviceLoop bid expired",
+                    Message=json.dumps(payload),
+                )
+
+            if buyer_pk:
+                buyer_email = ddb_get_user_email(buyer_pk)
+                write_user_notification(
+                    table=table,
+                    user_pk=buyer_pk,
+                    notif_type="BID_EXPIRED",
+                    message=(
+                        f"Your bid in market {bid.get('MarketKey','-')} has expired without a match. "
+                        "You may place a new bid if you are still interested."
+                    ),
+                )
+                logger.info("[EMAIL] bid_expired buyer_pk=%s buyer_email=%s", buyer_pk, buyer_email)
+
+                send_email(
+                    buyer_email,
+                    "DeviceLoop bid expired",
+                    (
+                        f"Your bid expired without a match.\n\n"
+                        f"Market: {bid.get('MarketKey','-')}\n"
+                        f"Bid: {bid.get('PK')} / {bid.get('SK')}\n"
+                        f"Expires at: {expires_at_str}\n"
+                    ),
+                )
+
+
+            continue  # do NOT treat as open
+
+        open_bids.append(bid)
+
+    return open_bids
+
+
+def load_active_listings_to_clear(now: datetime):
+    """
+    Returns two lists:
+      - interval listings to be matched now (while still within the window)
+      - end_of_window listings that have reached/passed AuctionEndsAt (FINAL match attempt)
+
+    Critical fix:
+      - end_of_window listings are NOT expired here.
+        They are collected for final matching, and only expired by the matching step if no crossing occurs.
+    """
+    listings_interval: list[dict] = []
+    listings_eow: list[dict] = []
+
     scan_kwargs = {
         "FilterExpression": (
             Attr("SK").eq("LISTING_REQUEST")
-            & Attr("MarketKey").eq(market_key)
             & Attr("Status").eq("active")
-            & Attr("AuctionMode").eq("continuous")
         )
     }
 
-    sellers = []
-    last_evaluated_key = None
+    last_key = None
     while True:
-        if last_evaluated_key:
-            scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
+        if last_key:
+            scan_kwargs["ExclusiveStartKey"] = last_key
+
         resp = table.scan(**scan_kwargs)
-        sellers.extend(resp.get("Items", []))
-        last_evaluated_key = resp.get("LastEvaluatedKey")
-        if not last_evaluated_key:
+
+        for item in resp.get("Items", []):
+            mode = item.get("AuctionMode")
+            start = parse_iso_utc(item.get("AuctionStartsAt"))
+            end = parse_iso_utc(item.get("AuctionEndsAt"))
+
+            if start and now < start:
+                continue
+            if not end:
+                continue
+
+            if mode == "interval":
+                # Clear repeatedly while within window
+                if now <= end:
+                    listings_interval.append(item)
+                else:
+                    # Interval listing passed end time and still active -> expire it (no final-run requirement stated)
+                    table.update_item(
+                        Key={"PK": item["PK"], "SK": item["SK"]},
+                        UpdateExpression="""
+                            SET #s = :expired,
+                                EndedAt = :endedAt,
+                                EndReason = :reason
+                        """,
+                        ExpressionAttributeNames={"#s": "Status"},
+                        ExpressionAttributeValues={
+                            ":expired": "expired",
+                            ":endedAt": now.isoformat(),
+                            ":reason": "expired_no_match",
+                        },
+                    )
+                    seller_pk = item.get("SellerPK")
+                    market_key = item.get("MarketKey") or ""
+                    if seller_pk:
+                        write_user_notification(
+                            table=table,
+                            user_pk=seller_pk,
+                            notif_type="LISTING_EXPIRED_NO_MATCH",
+                            message=(
+                                f"Your listing {item.get('PK')} in market {market_key} "
+                                f"expired without any matching bid."
+                            ),
+                        )
+                        seller_email = ddb_get_user_email(seller_pk)
+                        logger.info("[EMAIL] interval_listing_expired seller_pk=%s seller_email=%s", seller_pk, seller_email)
+                        send_email(
+                            seller_email,
+                            "DeviceLoop listing expired without match",
+                            (
+                                f"Your listing expired without any matching bid.\n\n"
+                                f"Listing: {item.get('PK')}\n"
+                                f"Market: {market_key}\n"
+                                f"Ended at: {now.isoformat()}\n"
+                            ),
+                        )
+
+
+            elif mode == "end_of_window":
+                # FINAL run happens AFTER end time: include it for matching; do not expire here.
+                if now >= end:
+                    listings_eow.append(item)
+
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
             break
 
-    log("info", "Loaded active continuous listings for market", marketKey=market_key, listingCount=len(sellers))
+    return listings_interval, listings_eow
 
-    # Filter by auction window and price envelope; then sort by SellerMin
-    candidates = []
-    for s in sellers:
-        if not is_within_auction_window(s, now):
-            continue
 
-        final_min = s.get("FinalMin") or s.get("InitialMin")
-        final_max = s.get("FinalMax") or s.get("InitialMax")
+def _num(v):
+    if isinstance(v, Decimal):
+        return float(v)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
-        final_min = float(final_min) if isinstance(final_min, (int, float, Decimal)) else None
-        final_max = float(final_max) if isinstance(final_max, (int, float, Decimal)) else None
 
-        seller_min = s.get("SellerMin")
-        seller_max = s.get("SellerMax")
-        seller_min = float(seller_min) if isinstance(seller_min, (int, float, Decimal)) else None
-        seller_max = float(seller_max) if isinstance(seller_max, (int, float, Decimal)) else None
+def run_double_auction_for_market(
+    market_key: str, mode: str, asks: list[dict], bids: list[dict], now: datetime
+) -> None:
+    """
+    Double auction for one (marketKey, mode).
 
-        if seller_min is None:
-            continue
+    Outcome:
+      - Crossing exists -> one winning listing + one winning bid (matched)
+      - No crossing -> expire all asks in this set (no_match) with seller notifications
+    """
+    buyer_topic_arn = SNS_TOPIC_ARN
+    seller_topic_arn = SNS_TOPIC_ARN
 
-        # Envelope checks
-        if final_min is not None and bid_price < final_min:
-            continue
-        if final_max is not None and bid_price > final_max:
-            continue
-        if seller_max is not None and bid_price > seller_max:
-            continue
+    logger.info(
+        "[CLEARING] Double auction market=%s mode=%s asks=%d bids=%d",
+        market_key,
+        mode,
+        len(asks),
+        len(bids),
+    )
 
-        candidates.append(
-            {
-                "raw": s,
-                "seller_min": seller_min,
-                "final_min": final_min,
-                "final_max": final_max,
-            }
-        )
-
-    if not candidates:
-        log(
-            "info",
-            "No suitable active listings found for this bid",
-            marketKey=market_key,
-            bidPk=bid_pk,
-            bidPrice=bid_price,
-        )
+    if not asks:
         return
 
-    candidates.sort(key=lambda c: c["seller_min"])
-
-    # 3) Try to match against the best seller (first that satisfies bid >= seller_min)
-    for c in candidates:
-        s = c["raw"]
-        seller_min = c["seller_min"]
-
-        if bid_price < seller_min:
+    priced_asks: list[tuple[float, dict]] = []
+    for listing in asks:
+        p = _num(listing.get("SellerMin") or listing.get("SellerMax"))
+        if p is None:
             continue
+        priced_asks.append((p, listing))
 
-        trade_price = (bid_price + seller_min) / 2.0
-        log(
-            "info",
-            "Match found for bid",
-            buyerPk=buyer_pk,
-            listingPk=s["PK"],
-            sellerMin=seller_min,
-            bidPrice=bid_price,
-            tradePrice=trade_price,
+    priced_bids: list[tuple[float, dict]] = []
+    for bid in bids:
+        bp = (
+            _num(bid.get("FinalBidPrice"))
+            or _num(bid.get("BuyerMax"))
+            or _num(bid.get("BidPrice"))
+        )
+        if bp is None:
+            continue
+        priced_bids.append((bp, bid))
+
+    # If no valid prices or no bids -> treat as no match and expire asks (this is needed for end_of_window final run)
+    if not priced_asks or not priced_bids:
+        logger.info("[CLEARING] No price-valid asks/bids for market=%s mode=%s -> no match", market_key, mode)
+        for listing in asks:
+            _expire_listing_no_match(listing, market_key, mode, now, seller_topic_arn)
+        return
+
+    priced_asks.sort(key=lambda t: t[0])
+    priced_bids.sort(key=lambda t: t[0], reverse=True)
+
+    k_cross: int | None = None
+    limit = min(len(priced_asks), len(priced_bids))
+    for i in range(limit):
+        ask_price, _ = priced_asks[i]
+        bid_price, _ = priced_bids[i]
+        if bid_price >= ask_price:
+            k_cross = i
+
+    if k_cross is None:
+        logger.info("[CLEARING] No crossing for market=%s mode=%s -> expire asks", market_key, mode)
+        for listing in asks:
+            _expire_listing_no_match(listing, market_key, mode, now, seller_topic_arn)
+        return
+
+    ask_price, winning_listing = priced_asks[k_cross]
+    bid_price, winning_bid = priced_bids[k_cross]
+    trade_price = (ask_price + bid_price) / 2.0
+
+    logger.info(
+        "[CLEARING] MATCH market=%s mode=%s buyer=%s listing=%s trade=%.2f",
+        market_key,
+        mode,
+        winning_bid.get("BuyerPK"),
+        winning_listing.get("PK"),
+        trade_price,
+    )
+
+    # Update winning listing
+    table.update_item(
+        Key={"PK": winning_listing["PK"], "SK": winning_listing["SK"]},
+        UpdateExpression="""
+            SET #s = :ended,
+                EndedAt = :endedAt,
+                CurrentTradePrice = :tradePrice,
+                FinalMin = :finalMin,
+                FinalMax = :finalMax,
+                MatchedBuyerPK = :buyerPk,
+                MatchedBidSK = :bidSk,
+                PaymentStatus = :paymentPending
+        """,
+        ExpressionAttributeNames={"#s": "Status"},
+        ExpressionAttributeValues={
+            ":ended": "ended",
+            ":endedAt": now.isoformat(),
+            ":tradePrice": Decimal(str(trade_price)),
+            ":finalMin": Decimal(str(ask_price)),
+            ":finalMax": Decimal(str(ask_price)),
+            ":buyerPk": winning_bid.get("BuyerPK"),
+            ":bidSk": winning_bid.get("SK"),
+            ":paymentPending": "pending",
+        },
+    )
+
+    # Mark other listings as ended (lost)
+    for _, listing in priced_asks:
+        if listing is winning_listing:
+            continue
+        table.update_item(
+            Key={"PK": listing["PK"], "SK": listing["SK"]},
+            UpdateExpression="""
+                SET #s = :ended,
+                    EndedAt = :endedAt,
+                    EndReason = :reason
+            """,
+            ExpressionAttributeNames={"#s": "Status"},
+            ExpressionAttributeValues={
+                ":ended": "ended",
+                ":endedAt": now.isoformat(),
+                ":reason": "lost_auction",
+            },
         )
 
+    # Update winning bid
+    table.update_item(
+        Key={"PK": winning_bid["PK"], "SK": winning_bid["SK"]},
+        UpdateExpression=(
+            "SET BidStatus = :s, "
+            "MatchedListingPK = :lp, "
+            "TradePrice = :tp, "
+            "MatchedTradePrice = :tp, "
+            "MatchedAt = :now"
+        ),
+        ExpressionAttributeValues={
+            ":s": "matched",
+            ":lp": winning_listing["PK"],
+            ":tp": Decimal(str(trade_price)),
+            ":now": now.isoformat(),
+        },
+    )
+
+    # TRADE item + trade notifications
+    buyer_pk = winning_bid.get("BuyerPK")
+    if buyer_pk:
         write_trade_item(
-            listing=s,
+            listing=winning_listing,
             buyer_pk=buyer_pk,
             bid_price=bid_price,
-            ask_price=seller_min,
+            ask_price=ask_price,
             trade_price=trade_price,
             now=now,
         )
-
         write_trade_notifications(
-            listing_item=s,
+            listing_item=winning_listing,
             buyer_pk=buyer_pk,
             trade_price=Decimal(str(trade_price)),
             now_iso=now.isoformat(),
         )
 
-        # Update listing as ended / sold and mark payment as pending
-        table.update_item(
-            Key={"PK": s["PK"], "SK": s["SK"]},
-            UpdateExpression=(
-                "SET #st = :ended, "
-                "PaymentStatus = :paymentPending, "
-                "MatchedBuyerPK = :b, "
-                "MatchedBidSK = :bidSk, "
-                "MatchedTradePrice = :tp, "
-                "TradePrice = :tp, "
-                "MatchedAt = :now, "
-                "CurrentHighestBid = :cbid, "
-                "CurrentHighestBidderPK = :b "
-            ),
-            ExpressionAttributeNames={"#st": "Status"},
-            ExpressionAttributeValues={
-                ":ended": "ended",
-                ":paymentPending": "pending",
-                ":b": buyer_pk,
-                ":bidSk": bid_sk,
-                ":tp": Decimal(str(trade_price)),
-                ":now": now.isoformat(),
-                ":cbid": Decimal(str(bid_price)),
-            },
-        )
-
-        # Mark bid as matched (and persist matched metadata for buyer pages)
-        table.update_item(
-            Key={"PK": bid_pk, "SK": bid_sk},
-            UpdateExpression=(
-                "SET BidStatus = :s, "
-                "MatchedListingPK = :lp, "
-                "TradePrice = :tp, "
-                "MatchedTradePrice = :tp, "
-                "MatchedAt = :now"
-            ),
-            ExpressionAttributeValues={
-                ":s": "matched",
-                ":lp": s["PK"],
-                ":tp": Decimal(str(trade_price)),
-                ":now": now.isoformat(),
-            },
-        )
-
-        log("info", "Match persisted to DynamoDB for bid", bidPk=bid_pk, bidSk=bid_sk)
-        return
-
-    log(
-        "info",
-        "No seller satisfied bid >= seller_min; bid remains open",
-        bidPk=bid_pk,
-        bidPrice=bid_price,
-    )
-
-
-def handle_new_listing_message(msg: dict) -> None:
-    """
-    Handle a NEW_LISTING message:
-    - Load the new listing
-    - If it is an active continuous auction inside its window,
-      search for open bids in that market and match the best one.
-    """
-    market_key = msg.get("marketKey")
-    listing_id = msg.get("listingId")
-
-    log("info", "[NEW_LISTING] Handling new listing message", marketKey=market_key, listingId=listing_id)
-
-    if not market_key or not listing_id:
-        log("error", "Missing marketKey or listingId in NEW_LISTING message, skipping", msg=msg)
-        return
-
-    # Load listing
-    resp = table.get_item(Key={"PK": listing_id, "SK": "LISTING_REQUEST"})
-    listing = resp.get("Item")
-    if not listing:
-        log("warning", "Listing not found in DynamoDB, maybe already deleted", listingId=listing_id)
-        return
-
-    status = listing.get("Status")
-    if status != "active":
-        log("info", "Listing is not active, skipping", listingId=listing_id, status=status)
-        return
-
-    auction_mode = listing.get("AuctionMode") or "continuous"
-    if auction_mode != "continuous":
-        log(
-            "info",
-            "Listing auction mode is not continuous; skipping continuous matching",
-            listingId=listing_id,
-            auctionMode=auction_mode,
-        )
-        return
-
-    now = datetime.now(timezone.utc)
-    if not is_within_auction_window(listing, now):
-        log(
-            "info",
-            "Listing is not inside its auction window, skipping",
-            listingId=listing_id,
-            auctionStartsAt=listing.get("AuctionStartsAt"),
-            auctionEndsAt=listing.get("AuctionEndsAt"),
-            now=now.isoformat(),
-        )
-        return
-
-    # Seller and platform envelopes
-    final_min = listing.get("FinalMin") or listing.get("InitialMin")
-    final_max = listing.get("FinalMax") or listing.get("InitialMax")
-    if isinstance(final_min, Decimal):
-        final_min = float(final_min)
-    if isinstance(final_max, Decimal):
-        final_max = float(final_max)
-
-    seller_min = listing.get("SellerMin")
-    seller_max = listing.get("SellerMax")
-    if isinstance(seller_min, Decimal):
-        seller_min = float(seller_min)
-    if isinstance(seller_max, Decimal):
-        seller_max = float(seller_max)
-
-    if seller_min is None:
-        log("warning", "Listing has no SellerMin; cannot run continuous matching", listingId=listing_id)
-        return
-
-    # Load open bids for this market
-    pk = f"MARKET#{market_key}"
-    query_kwargs = {
-        "KeyConditionExpression": Key("PK").eq(pk),
-        "FilterExpression": Attr("BidStatus").eq("open"),
+    # Publish trade matched to Amazon Simple Notification Service
+    payload = {
+        "type": "TRADE_MATCHED",
+        "marketKey": market_key,
+        "mode": mode,
+        "listingPk": winning_listing["PK"],
+        "listingSk": winning_listing["SK"],
+        "sellerPk": winning_listing.get("SellerPK"),
+        "buyerPk": winning_bid.get("BuyerPK"),
+        "bidPk": winning_bid.get("PK"),
+        "bidSk": winning_bid.get("SK"),
+        "tradePrice": trade_price,
+        "paymentStatus": "pending",
     }
+    message = json.dumps(payload)
 
-    bids = []
-    last_evaluated_key = None
-    while True:
-        if last_evaluated_key:
-            query_kwargs["ExclusiveStartKey"] = last_evaluated_key
-        resp = table.query(**query_kwargs)
-        for item in resp.get("Items", []):
-            exp_str = item.get("BidExpiresAt")
-            if exp_str:
-                try:
-                    exp = datetime.fromisoformat(exp_str)
-                    if now >= exp:
-                        continue
-                except Exception:
-                    continue
-            bids.append(item)
-        last_evaluated_key = resp.get("LastEvaluatedKey")
-        if not last_evaluated_key:
-            break
-
-    log("info", "Loaded open bids for market", marketKey=market_key, openBidCount=len(bids))
-
-    # Filter bids that fit the envelopes
-    candidate_bids = []
-    for b in bids:
-        price = b.get("BidPrice")
-        if isinstance(price, Decimal):
-            price = float(price)
-        if not isinstance(price, (int, float)):
-            continue
-        bid_price = float(price)
-
-        if final_min is not None and bid_price < final_min:
-            continue
-        if final_max is not None and bid_price > final_max:
-            continue
-        if seller_min is not None and bid_price < seller_min:
-            continue
-        if seller_max is not None and bid_price > seller_max:
-            continue
-
-        candidate_bids.append({"raw": b, "price": bid_price})
-
-    if not candidate_bids:
-        log(
-            "info",
-            "No suitable open bids found for this new listing",
-            listingId=listing_id,
-            marketKey=market_key,
+    if seller_topic_arn and winning_listing.get("SellerPK"):
+        sns.publish(
+            TopicArn=seller_topic_arn,
+            Subject="DeviceLoop trade matched",
+            Message=message,
         )
-        return
+    if buyer_topic_arn and winning_bid.get("BuyerPK"):
+        sns.publish(
+            TopicArn=buyer_topic_arn,
+            Subject="DeviceLoop trade matched",
+            Message=message,
+        )
 
-    # Choose highest bid
-    candidate_bids.sort(key=lambda x: x["price"], reverse=True)
-    best_bid = candidate_bids[0]
-    bid_item = best_bid["raw"]
-    bid_price = best_bid["price"]
-    buyer_pk = bid_item.get("BuyerPK")
 
-    trade_price = (bid_price + seller_min) / 2.0
-    log(
-        "info",
-        "[NEW_LISTING MATCH] Match found",
-        buyerPk=buyer_pk,
-        listingId=listing_id,
-        sellerMin=seller_min,
-        bidPrice=bid_price,
-        tradePrice=trade_price,
-    )
-
-    # Persist trade
-    write_trade_item(
-        listing=listing,
-        buyer_pk=buyer_pk,
-        bid_price=bid_price,
-        ask_price=seller_min,
-        trade_price=trade_price,
-        now=now,
-    )
-
-    write_trade_notifications(
-        listing_item=listing,
-        buyer_pk=buyer_pk,
-        trade_price=Decimal(str(trade_price)),
-        now_iso=now.isoformat(),
-    )
-
-    # Update listing
+def _expire_listing_no_match(listing: dict, market_key: str, mode: str, now: datetime, seller_topic_arn: str | None):
     table.update_item(
         Key={"PK": listing["PK"], "SK": listing["SK"]},
-        UpdateExpression=(
-            "SET #st = :ended, "
-            "PaymentStatus = :paymentPending, "
-            "MatchedBuyerPK = :b, "
-            "MatchedBidSK = :bidSk, "
-            "MatchedTradePrice = :tp, "
-            "TradePrice = :tp, "
-            "MatchedAt = :now, "
-            "CurrentHighestBid = :cbid, "
-            "CurrentHighestBidderPK = :b "
-        ),
-        ExpressionAttributeNames={"#st": "Status"},
+        UpdateExpression="""
+            SET #s = :expired,
+                EndedAt = :endedAt,
+                EndReason = :reason
+        """,
+        ExpressionAttributeNames={"#s": "Status"},
         ExpressionAttributeValues={
-            ":ended": "ended",
-            ":paymentPending": "pending",
-            ":b": buyer_pk,
-            ":bidSk": bid_item["SK"],
-            ":tp": Decimal(str(trade_price)),
-            ":now": now.isoformat(),
-            ":cbid": Decimal(str(bid_price)),
+            ":expired": "expired",
+            ":endedAt": now.isoformat(),
+            ":reason": "no_match",
         },
     )
 
-    # Update bid
-    table.update_item(
-        Key={"PK": bid_item["PK"], "SK": bid_item["SK"]},
-        UpdateExpression=(
-            "SET BidStatus = :s, "
-            "MatchedListingPK = :lp, "
-            "MatchedTradePrice = :tp, "
-            "TradePrice = :tp, "
-            "MatchedAt = :now"
-        ),
-        ExpressionAttributeValues={
-            ":s": "matched",
-            ":lp": listing["PK"],
-            ":tp": Decimal(str(trade_price)),
-            ":now": now.isoformat(),
-        },
-    )
+    seller_pk = listing.get("SellerPK")
 
+    if seller_topic_arn and seller_pk:
+        payload = {
+            "type": "LISTING_EXPIRED_NO_MATCH",
+            "sellerPk": seller_pk,
+            "marketKey": market_key,
+            "listingPk": listing["PK"],
+            "listingSk": listing["SK"],
+            "mode": mode,
+        }
+        sns.publish(
+            TopicArn=seller_topic_arn,
+            Subject="DeviceLoop listing expired with no match",
+            Message=json.dumps(payload),
+        )
 
-
-    log(
-        "info",
-        "[NEW_LISTING MATCH] Match persisted to DynamoDB",
-        listingId=listing_id,
-        bidPk=bid_item.get("PK"),
-        bidSk=bid_item.get("SK"),
-    )
-
-
-def is_within_auction_window(listing: dict, now: datetime) -> bool:
-    """
-    Returns True if 'now' is between AuctionStartsAt and AuctionEndsAt.
-    If timestamps are missing or malformed, be conservative and return False.
-    """
-    start_str = listing.get("AuctionStartsAt")
-    end_str = listing.get("AuctionEndsAt")
-
-    try:
-        if start_str:
-            start = datetime.fromisoformat(start_str)
-            if now < start:
-                return False
-        if end_str:
-            end = datetime.fromisoformat(end_str)
-            if now > end:
-                return False
-    except Exception as e:
-        log("error", "Error parsing auction window", error=str(e), start=start_str, end=end_str)
-        return False
-
-    return True
-
+    if seller_pk:
+        message = (
+            f"Your listing {listing.get('PK')} in market {market_key} "
+            f"expired without any matching bid."
+        )
+        write_user_notification(
+            table=table,
+            user_pk=seller_pk,
+            notif_type="LISTING_EXPIRED_NO_MATCH",
+            message=message,
+        )
+        seller_email = ddb_get_user_email(seller_pk)
+        logger.info("[EMAIL] eow_listing_expired seller_pk=%s seller_email=%s", seller_pk, seller_email)
+        send_email(
+            seller_email,
+            "DeviceLoop listing expired without match",
+            (
+                f"Your listing expired without any matching bid.\n\n"
+                f"Listing: {listing.get('PK')}\n"
+                f"Market: {market_key}\n"
+                f"Mode: {mode}\n"
+                f"Ended at: {now.isoformat()}\n"
+            ),
+        )
 
 def write_trade_item(
     listing: dict,
@@ -594,12 +704,6 @@ def write_trade_item(
     trade_price: float,
     now: datetime,
 ) -> None:
-    """
-    Write a TRADE item alongside the listing for history and reporting.
-
-    This function does not update the listing or bid status.
-    That is handled by the caller.
-    """
     listing_pk = listing["PK"]
     market_key = listing.get("MarketKey")
     seller_pk = listing.get("SellerPK")
@@ -620,14 +724,9 @@ def write_trade_item(
     }
 
     table.put_item(Item=trade_item)
-    log("info", "TRADE item written", listingPk=listing_pk, buyerPk=buyer_pk, sellerPk=seller_pk)
 
 
-def write_trade_notifications(listing_item, buyer_pk: str, trade_price: Decimal, now_iso: str) -> None:
-    """
-    Create DynamoDB notification items for buyer and seller,
-    and optionally publish to Amazon Simple Notification Service.
-    """
+def write_trade_notifications(listing_item, buyer_pk: str, trade_price: Decimal, now_iso: str):
     listing_pk = listing_item["PK"]
     seller_pk = listing_item.get("SellerPK")
     device_pk = listing_item.get("DevicePK")
@@ -664,14 +763,29 @@ def write_trade_notifications(listing_item, buyer_pk: str, trade_price: Decimal,
             }
         )
 
-    log(
-        "info",
-        "Trade notifications written",
-        listingPk=listing_pk,
-        buyerPk=buyer_pk,
-        sellerPk=seller_pk,
-        marketKey=market_key,
+    buyer_email = ddb_get_user_email(buyer_pk)
+    seller_email = ddb_get_user_email(seller_pk)
+
+    buyer_body = (
+        f"Your bid matched a listing.\n\n"
+        f"Listing: {listing_pk}\n"
+        f"Market: {market_key}\n"
+        f"Trade price: {float(trade_price)}\n"
+        f"Matched at: {now_iso}\n\n"
+        f"Please log in to complete payment."
     )
+    seller_body = (
+        f"Your listing matched a bid.\n\n"
+        f"Listing: {listing_pk}\n"
+        f"Market: {market_key}\n"
+        f"Trade price: {float(trade_price)}\n"
+        f"Matched at: {now_iso}\n\n"
+        f"Please log in to view the sale details."
+    )
+
+    send_email(buyer_email, "DeviceLoop trade matched", buyer_body)
+    send_email(seller_email, "DeviceLoop trade matched", seller_body)
+
 
     if SNS_TOPIC_ARN:
         try:
@@ -692,6 +806,19 @@ def write_trade_notifications(listing_item, buyer_pk: str, trade_price: Decimal,
                     default=str,
                 ),
             )
-            log("info", "Published trade notification to Amazon Simple Notification Service", topicArn=SNS_TOPIC_ARN)
         except Exception as e:
-            log("error", "Failed to publish to Amazon Simple Notification Service", error=str(e))
+            logger.warning("[NOTIF] Failed to publish to Amazon Simple Notification Service: %s", e)
+
+
+def write_user_notification(table, user_pk, notif_type, message: str):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    table.put_item(
+        Item={
+            "PK": f"NOTIF#{user_pk}",
+            "SK": f"TS#{now_iso}#EVENT#{notif_type}",
+            "Type": notif_type,
+            "Message": message,
+            "CreatedAt": now_iso,
+            "Read": False,
+        }
+    )

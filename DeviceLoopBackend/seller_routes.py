@@ -399,21 +399,115 @@ def delete_listing(listing_id):
     table.delete_item(Key=key)
     return jsonify({"ok": True})
 
-# ---------- Orders (seller view) ----------
 @bp.get("/orders")
 @require_role("sellers", "admin")
 def list_orders():
+    """
+    Seller orders = listings that have been matched to a buyer.
+    Payment is considered completed when PaymentStatus == "paid" and PaidAt exists.
+    """
     seller_pk = _seller_pk_from_session()
     if not seller_pk:
         return ("Unauthorized", 401)
 
-    status = request.args.get("status")  # optional filter
-    page_size = min(int(request.args.get("limit", "25")), 100)
-
     table = current_app.ddb_table
-    # TODO: Query GSI by SellerId if your orders are keyed by order PK
-    items = []
-    return jsonify({"items": items})
+
+    payment_status = (request.args.get("paymentStatus") or "all").lower()
+
+    # If you do NOT want a limit at all, just don't send ?limit=...
+    limit_raw = request.args.get("limit")
+    limit = int(limit_raw) if (limit_raw and limit_raw.isdigit()) else None
+
+    # Only matched listings that belong to THIS seller (restriction is here)
+    filter_expr = (
+        Attr("SK").eq("LISTING_REQUEST")
+        & Attr("SellerPK").eq(seller_pk)
+        & Attr("MatchedBuyerPK").exists()
+    )
+
+    if payment_status == "paid":
+        filter_expr = filter_expr & Attr("PaymentStatus").eq("paid")
+    elif payment_status in ("unpaid", "pending"):
+        filter_expr = filter_expr & (
+            Attr("PaymentStatus").ne("paid") | Attr("PaymentStatus").not_exists()
+        )
+    else:
+        # "all" -> no extra filter
+        pass
+
+    items: list[dict] = []
+    start_key = None
+
+    # This is NOT a total cap. It is per scan request.
+    # Even if you remove this, Amazon DynamoDB still paginates at about 1 megabyte per response.
+    page_size = 250
+
+    while True:
+        scan_kwargs = {"FilterExpression": filter_expr, "Limit": page_size}
+        if start_key:
+            scan_kwargs["ExclusiveStartKey"] = start_key
+
+        resp = table.scan(**scan_kwargs)
+        items.extend(resp.get("Items", []))
+
+        # Stop early only if the client supplied a limit
+        if limit is not None and len(items) >= limit:
+            items = items[:limit]
+            break
+
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break  # end of table
+
+
+
+    def _as_float(val) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+
+    orders: list[dict] = []
+    for it in items:
+        raw_trade_price = (
+            it.get("CurrentTradePrice")
+            or it.get("MatchedTradePrice")
+            or it.get("TradePrice")
+            or 0
+        )
+
+        paid = (it.get("PaymentStatus") == "paid")
+        orders.append(
+            {
+                "listingId": it.get("PK"),
+                "marketKey": it.get("MarketKey") or it.get("Market"),
+                "brand": it.get("Brand"),
+                "model": it.get("Model"),
+                "variant": it.get("Variant"),
+                "grade": it.get("Grade"),
+                "tradePrice": _as_float(raw_trade_price),
+                "matchedBuyerPk": it.get("MatchedBuyerPK"),
+                "paymentStatus": "paid" if paid else "unpaid",
+                "paidAt": it.get("PaidAt"),
+                "listingStatus": it.get("ListingStatus") or it.get("Status"),
+                "createdAt": it.get("CreatedAt"),
+                "updatedAt": it.get("UpdatedAt"),
+            }
+        )
+
+    # Sort newest-first using PaidAt if it exists, otherwise UpdatedAt/CreatedAt.
+    def _sort_key(o: dict) -> str:
+        return (
+            o.get("paidAt")
+            or o.get("updatedAt")
+            or o.get("createdAt")
+            or ""
+        )
+
+    orders.sort(key=_sort_key, reverse=True)
+
+    return jsonify({"ok": True, "items": orders})
+
 
 @bp.post("/orders/<order_id>/ship")
 @require_role("sellers", "admin")

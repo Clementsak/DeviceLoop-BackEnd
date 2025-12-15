@@ -12,7 +12,7 @@ from boto3.dynamodb.conditions import Attr, Key
 from .s3_utils import presign_get
 import urllib.parse
 from botocore.exceptions import ClientError
-
+import re
 from .guards import require_role
 from .auth_routes import _find_user_pk_by_sub, _profile_key
 
@@ -28,6 +28,43 @@ FilterExpression = (
     & Attr("AuctionMode").eq("continuous")
     & (Attr("AuctionEndsAt").gt(now_iso) | Attr("AuctionEndsAt").not_exists())
 )
+
+EMAIL_FROM = os.environ.get("EMAIL_FROM")
+AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-1")
+
+simple_email_service_client = boto3.client("ses", region_name=AWS_REGION)
+
+def _ddb_get_user_email(table, user_pk: str | None) -> str | None:
+    if not user_pk:
+        return None
+    resp = table.get_item(Key={"PK": user_pk, "SK": "PROFILE"})
+    item = resp.get("Item") or {}
+    # adjust this key if your PROFILE uses a different attribute name
+    return item.get("Email") or item.get("email")
+
+def _send_email(to_addr: str | None, subject: str, body: str) -> None:
+    if not to_addr:
+        print(f"[EMAIL] skip: no recipient (subject={subject})")
+        return
+    if not EMAIL_FROM:
+        print("[EMAIL] skip: EMAIL_FROM is not set")
+        return
+
+    try:
+        resp = simple_email_service_client.send_email(
+            Source=EMAIL_FROM,
+            Destination={"ToAddresses": [to_addr]},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
+            },
+        )
+        print(
+            f"[EMAIL] sent ok to={to_addr} subject={subject} messageId={resp.get('MessageId')}"
+        )
+    except Exception as exc:
+        # never break payment flow because email failed
+        print(f"[EMAIL] send failed to={to_addr} subject={subject} error={exc}")
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -872,55 +909,41 @@ def list_notifications():
         except Exception:
             return "the agreed price"
 
-    def _canon_type(raw_type: str | None) -> str:
-        """
-        Canonicalize legacy / mixed notification type values.
-        """
+    ALLOWED_NOTIFICATION_TYPES = {
+        "TRADE_MATCHED",
+        "BID_EXPIRED",
+        "LISTING_EXPIRED_NO_MATCH",
+        "PAYMENT_COMPLETED",
+    }
+
+    def _canon_type(raw_type: str | None) -> str | None:
         if not raw_type:
-            return "SYSTEM"
+            return None
+        t = str(raw_type).strip().upper()
+        return t if t in ALLOWED_NOTIFICATION_TYPES else None
 
-        t = str(raw_type).strip()
-
-        # Allow both lowercase and uppercase legacy values
-        upper = t.upper()
-
-        # Map legacy names to canonical names
-        legacy_map = {
-            "TRADE_FILLED": "TRADE_MATCHED",
-            "TRADE_MATCHED": "TRADE_MATCHED",
-            "BID_EXPIRED": "BID_EXPIRED",
-            "LISTING_EXPIRED_NO_MATCH": "LISTING_EXPIRED_NO_MATCH",
-            "PAYMENT_COMPLETED": "PAYMENT_COMPLETED",
-            "PAYMENT_COMPLETED ": "PAYMENT_COMPLETED",
-            "PAYMENT": "PAYMENT_COMPLETED",
-            "PAYMENT_COMPLETED#BUYER": "PAYMENT_COMPLETED",
-            "PAYMENT_COMPLETED#SELLER": "PAYMENT_COMPLETED",
-            "PAYMENT_COMPLETED_EVENT": "PAYMENT_COMPLETED",
-            "PAYMENT_COMPLETED_NOTIFICATION": "PAYMENT_COMPLETED",
-            "PAYMENT_COMPLETED_NOTIF": "PAYMENT_COMPLETED",
-            "PAYMENT_COMPLETED.": "PAYMENT_COMPLETED",
-
-            # If you previously stored lowercase:
-            "PAYMENT_COMPLETED".lower(): "PAYMENT_COMPLETED",
-            "payment_completed": "PAYMENT_COMPLETED",
-
-            # If you previously stored "trade_filled" lowercase:
-            "trade_filled": "TRADE_MATCHED",
-        }
-
-        return legacy_map.get(t, legacy_map.get(upper, upper if upper else "SYSTEM"))
 
     projected: list[dict] = []
 
     for raw in items:
         notif_type = _canon_type(raw.get("Type") or raw.get("type"))
+        if not notif_type:
+            # Skip legacy/unknown notifications so your page stays consistent
+            continue
+
         user_role = (raw.get("UserRole") or raw.get("Role") or "buyer").lower()
         market_key = raw.get("MarketKey") or ""
         trade_price = raw.get("TradePrice")
         created_at = raw.get("CreatedAt") or raw.get("PaidAt") or raw.get("MatchedAt") or raw.get("EndedAt") or ""
 
         # Standardize read flag
-        is_read = bool(raw.get("Read", False))
+        read_val = raw.get("Read", raw.get("read", False))
+        if isinstance(read_val, bool):
+            is_read = read_val
+        elif isinstance(read_val, str):
+            is_read = read_val.strip().lower() == "true"
+        else:
+            is_read = False
 
         message_from_item = raw.get("Message")
 
@@ -1556,10 +1579,70 @@ def pay_for_purchase(listing_id: str):
         buyer_notif = make_notif(buyer_pk, "buyer", "BUYER")
         table.put_item(Item=buyer_notif)
 
+        try:
+            buyer_email = _ddb_get_user_email(table, buyer_pk)  # must return string or None
+            if buyer_email:
+                subject = "DeviceLoop: Payment completed"
+                device_name = " ".join([str(x) for x in [brand, model, variant] if x])
+                body = (
+                    f"Your payment has been completed.\n\n"
+                    f"Listing: {listing_pk}\n"
+                    f"Market: {market_key}\n"
+                    f"Device: {device_name}\n"
+                    f"Trade price: {trade_price_num:.2f}\n"
+                    f"Paid at: {paid_at_iso}\n"
+                )
+                _send_email(buyer_email, subject, body)
+                current_app.logger.info(
+                    "[EMAIL] PAYMENT_COMPLETED buyer sent",
+                    extra={"to": buyer_email, "listingPk": listing_pk, "marketKey": market_key},
+                )
+            else:
+                current_app.logger.warning(
+                    "[EMAIL] PAYMENT_COMPLETED buyer missing email",
+                    extra={"buyerPk": buyer_pk, "listingPk": listing_pk},
+                )
+        except Exception:
+            # Do NOT fail payment if email fails
+            current_app.logger.exception(
+                "[EMAIL] PAYMENT_COMPLETED buyer send failed",
+                extra={"buyerPk": buyer_pk, "listingPk": listing_pk},
+            )
+
+
         # Seller notification (if we know the seller)
         if seller_pk:
             seller_notif = make_notif(seller_pk, "seller", "SELLER")
             table.put_item(Item=seller_notif)
+
+            try:
+                seller_email = _ddb_get_user_email(table, seller_pk)
+                if seller_email:
+                    subject = "DeviceLoop: Buyer payment completed"
+                    device_name = " ".join([str(x) for x in [brand, model, variant] if x])
+                    body = (
+                        f"The buyer has completed payment.\n\n"
+                        f"Listing: {listing_pk}\n"
+                        f"Market: {market_key}\n"
+                        f"Device: {device_name}\n"
+                        f"Trade price: {trade_price_num:.2f}\n"
+                        f"Paid at: {paid_at_iso}\n"
+                    )
+                    _send_email(seller_email, subject, body)
+                    current_app.logger.info(
+                        "[EMAIL] PAYMENT_COMPLETED seller sent",
+                        extra={"to": seller_email, "listingPk": listing_pk, "marketKey": market_key},
+                    )
+                else:
+                    current_app.logger.warning(
+                        "[EMAIL] PAYMENT_COMPLETED seller missing email",
+                        extra={"sellerPk": seller_pk, "listingPk": listing_pk},
+                    )
+            except Exception:
+                current_app.logger.exception(
+                    "[EMAIL] PAYMENT_COMPLETED seller send failed",
+                    extra={"sellerPk": seller_pk, "listingPk": listing_pk},
+                )
 
         # 4) Response for the frontend
         return jsonify(
@@ -1596,60 +1679,6 @@ def pay_for_purchase(listing_id: str):
                 }
             ),
             500,
-        )
-
-
-from datetime import datetime, timezone
-
-def _create_payment_notifications(table, listing_item: dict, buyer_pk: str, seller_pk: str) -> None:
-    """
-    Create 'payment_completed' notifications for both buyer and seller.
-
-    table       - DynamoDB table resource
-    listing_item- the listing item as stored in DynamoDB
-    buyer_pk    - PK of the buyer profile (e.g. PROFILE#<sub>)
-    seller_pk   - PK of the seller profile
-    """
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    trade_price = (
-        listing_item.get("MatchedTradePrice")
-        or listing_item.get("CurrentTradePrice")
-        or 0
-    )
-
-    base_payload = {
-        "Type": "payment_completed",
-        "ListingPK": listing_item.get("PK"),
-        "DevicePK": listing_item.get("DevicePK"),
-        "MarketKey": listing_item.get("MarketKey"),
-        "TradePrice": float(trade_price),
-        "AuctionMode": listing_item.get("AuctionMode", "continuous"),
-        "CreatedAt": now,
-        "Read": False,
-    }
-
-    # Buyer notification
-    if buyer_pk:
-        table.put_item(
-            Item={
-                "PK": f"NOTIF#{buyer_pk}",
-                "SK": f"TS#{now}#PAYMENT#BUYER",
-                "UserRole": "buyer",
-                **base_payload,
-            }
-        )
-
-    # Seller notification
-    if seller_pk:
-        table.put_item(
-            Item={
-                "PK": f"NOTIF#{seller_pk}",
-                "SK": f"TS#{now}#PAYMENT#SELLER",
-                "UserRole": "seller",
-                **base_payload,
-            }
         )
 
 @bp.post("/notifications/mark-read")
