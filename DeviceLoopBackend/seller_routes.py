@@ -30,30 +30,76 @@ def _seller_pk_from_session():
 def _listing_key(seller_pk: str, listing_id: str):
     return {"PK": f"SELLER#{seller_pk}", "SK": f"LISTING#{listing_id}"}
 
+def _table():
+    """Return the shared DynamoDB table."""
+    return current_app.ddb_table
 
 # ---------- Dashboard summary ----------
 @bp.get("/summary")
 @require_role("sellers", "admin")
 def seller_summary():
-    seller_pk = _seller_pk_from_session()
+    seller_pk = session.get("userPk") or _seller_pk_from_session()
     if not seller_pk:
-        return ("Unauthorized", 401)
+        return jsonify({"ok": False, "error": "Not signed in"}), 401
 
-    table = current_app.ddb_table
+    table = _table()
 
-    # TODO: Replace with real queries
-    data = {
-        "listings_active": 0,
-        "orders_pending": 0,
-        "messages_unread": 0,
-        "next_payout": {"amount": 0, "date": None},
-        "generated_at": _utc_now_iso(),
-    }
-    return jsonify(data)
+    # Your listings + requests are stored as:
+    # PK = LISTREQ#<seller_pk>#<ts>
+    # SK = LISTING_REQUEST
+    base_listing_filter = (
+        Attr("SK").eq("LISTING_REQUEST")
+        & (Attr("SellerPK").eq(seller_pk) | Attr("SellerPk").eq(seller_pk))
+    )
 
-def _table():
-    """Return the shared DynamoDB table."""
-    return current_app.ddb_table
+    def scan_count(filter_expr):
+        total = 0
+        start_key = None
+        while True:
+            kwargs = {"Select": "COUNT", "FilterExpression": filter_expr}
+            if start_key:
+                kwargs["ExclusiveStartKey"] = start_key
+            resp = table.scan(**kwargs)
+            total += int(resp.get("Count", 0))
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
+        return total
+
+    # Active listings = listing requests that have been activated
+    active_count = scan_count(base_listing_filter & Attr("Status").eq("active"))
+
+    # Pending requests = awaiting admin review (unverified / pending)
+    pending_requests = scan_count(
+        base_listing_filter
+        & (Attr("Status").eq("unverified") | Attr("Status").eq("pending"))
+    )
+
+    # Pending payments = matched listings that are not paid yet
+    # (matches your /seller/orders logic: MatchedBuyerPK exists + PaymentStatus not paid)
+    orders_pending = scan_count(
+        base_listing_filter
+        & Attr("MatchedBuyerPK").exists()
+        & (Attr("PaymentStatus").ne("paid") | Attr("PaymentStatus").not_exists())
+    )
+
+    # Unread notifications
+    notif_pk = f"NOTIF#{seller_pk}"
+    resp = table.query(KeyConditionExpression=Key("PK").eq(notif_pk))
+    notifs = resp.get("Items", [])
+    messages_unread = sum(1 for n in notifs if not n.get("Read", False))
+
+    return jsonify(
+        {
+            "ok": True,
+            "listings_active": int(active_count),
+            "orders_pending": int(orders_pending),
+            "requests_pending": int(pending_requests),
+            "messages_unread": int(messages_unread),
+            "next_payout": None,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 @bp.post("/listing-requests")
@@ -339,66 +385,6 @@ def accept_grade_and_activate(listing_id):
 
     return jsonify({"ok": True})
 
-
-@bp.get("/listings/<listing_id>")
-@require_role("sellers", "admin")
-def get_listing(listing_id):
-    seller_pk = _seller_pk_from_session()
-    if not seller_pk:
-        return ("Unauthorized", 401)
-
-    table =  _table()
-    key = {"PK": listing_id, "SK": "LISTING_REQUEST"}
-    resp = table.get_item(Key=key, ConsistentRead=True)
-    item = resp.get("Item")
-    if not item or item.get("SellerPK") != seller_pk:
-        return ("Not found", 404)
-    return jsonify(item)
-
-@bp.put("/listings/<listing_id>")
-@require_role("sellers", "admin")
-def update_listing(listing_id):
-    seller_pk = _seller_pk_from_session()
-    if not seller_pk:
-        return ("Unauthorized", 401)
-
-    data = request.get_json(force=True) or {}
-    data["UpdatedAt"] = _utc_now_iso()
-
-    table = _table()
-    key = {"PK": listing_id, "SK": "LISTING_REQUEST"}
-
-    # For simplicity, overwrite (you can switch to UpdateExpression later)
-    resp = table.get_item(Key=key, ConsistentRead=True)
-    item = resp.get("Item")
-    if not item or item.get("SellerPK") != seller_pk:
-        return ("Not found", 404)
-
-    for k, v in data.items():
-        if k in {"PK", "SK", "SellerPK"}:
-            continue
-        item[k] = v
-
-    table.put_item(Item=item)
-    return jsonify({"ok": True})
-
-@bp.delete("/listings/<listing_id>")
-@require_role("sellers", "admin")
-def delete_listing(listing_id):
-    seller_pk = _seller_pk_from_session()
-    if not seller_pk:
-        return ("Unauthorized", 401)
-
-    table = _table()
-    key = {"PK": listing_id, "SK": "LISTING_REQUEST"}
-    resp = table.get_item(Key=key, ConsistentRead=True)
-    item = resp.get("Item")
-    if not item or item.get("SellerPK") != seller_pk:
-        return ("Not found", 404)
-
-    table.delete_item(Key=key)
-    return jsonify({"ok": True})
-
 @bp.get("/orders")
 @require_role("sellers", "admin")
 def list_orders():
@@ -427,7 +413,7 @@ def list_orders():
 
     if payment_status == "paid":
         filter_expr = filter_expr & Attr("PaymentStatus").eq("paid")
-    elif payment_status in ("unpaid", "pending"):
+    elif payment_status in ("pending"):
         filter_expr = filter_expr & (
             Attr("PaymentStatus").ne("paid") | Attr("PaymentStatus").not_exists()
         )
@@ -476,7 +462,13 @@ def list_orders():
             or 0
         )
 
-        paid = (it.get("PaymentStatus") == "paid")
+        raw_ps = (it.get("PaymentStatus") or "pending")
+        raw_ps = raw_ps.lower() if isinstance(raw_ps, str) else "pending"
+        if raw_ps != "paid":
+            raw_ps = "pending"
+
+        paid = (raw_ps == "paid")
+
         orders.append(
             {
                 "listingId": it.get("PK"),
@@ -487,7 +479,7 @@ def list_orders():
                 "grade": it.get("Grade"),
                 "tradePrice": _as_float(raw_trade_price),
                 "matchedBuyerPk": it.get("MatchedBuyerPK"),
-                "paymentStatus": "paid" if paid else "unpaid",
+                "paymentStatus": raw_ps,
                 "paidAt": it.get("PaidAt"),
                 "listingStatus": it.get("ListingStatus") or it.get("Status"),
                 "createdAt": it.get("CreatedAt"),
@@ -632,7 +624,7 @@ def list_listing_requests():
         status = (row.get("Status") or "").lower()
 
         # Treat active (and optionally ended) as "ongoing listings"
-        if status in ("active", "ended"):
+        if status in ("active", "ended", "expired"):
             listings.append(row)
         else:
             requests.append(row)

@@ -14,7 +14,7 @@ import urllib.parse
 from botocore.exceptions import ClientError
 import re
 from .guards import require_role
-from .auth_routes import _find_user_pk_by_sub, _profile_key
+from .auth_routes import _find_user_pk_by_sub
 
 bp = Blueprint("buyer", __name__, url_prefix="/buyer")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
@@ -77,11 +77,6 @@ def _buyer_pk_from_session() -> str | None:
     table = current_app.ddb_table
     return _find_user_pk_by_sub(table, u["sub"])
 
-
-def _location_client():
-    region = current_app.config.get("AWS_REGION", "ap-southeast-1")
-    return boto3.client("location", region_name=region)
-
 def _sqs_client():
   region = current_app.config.get("AWS_REGION", "ap-southeast-1")
   return boto3.client("sqs", region_name=region)
@@ -95,105 +90,6 @@ def _user_pk_from_session() -> str | None:
         return None
     table = current_app.ddb_table
     return _find_user_pk_by_sub(table, u["sub"])
-
-@bp.post("/verify/location")
-@require_role("buyers", "admin")
-def submit_location_verification():
-    """
-    Body:
-      {
-        "latitude":  3.21234,
-        "longitude": 101.71234
-      }
-
-    Called after browser geolocation (navigator.geolocation) on the frontend.
-    We:
-      - Reverse geocode with Amazon Location Service
-      - Store a VERIFY#USER#ACTIVE item in DynamoDB
-      - Mark profile VerifiedStatus='pending'
-      - Expose it to admin via /admin/verify/queue
-    """
-    buyer_pk = _buyer_pk_from_session()
-    if not buyer_pk:
-        return ("Unauthorized", 401)
-
-    data = request.get_json(force=True) or {}
-    try:
-        lat = float(data["latitude"])
-        lon = float(data["longitude"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify(error="latitude and longitude (numbers) are required"), 400
-
-    index_name = current_app.config.get("AWS_LOCATION_INDEX", "deviceloop-place-index")
-    if not index_name:
-        return jsonify(error="AWS_LOCATION_INDEX is not configured on backend"), 500
-
-
-    loc = _location_client()
-    resp = loc.search_place_index_for_position(
-        IndexName=index_name,
-        Position=[lon, lat],  # NOTE: [longitude, latitude]
-        MaxResults=1,
-    )
-    results = resp.get("Results", [])
-    if not results:
-        return jsonify(error="Could not resolve this position"), 400
-
-    place = results[0]["Place"]
-    country = place.get("Country")
-    region = place.get("Region")
-    city = place.get("Municipality")
-    label = place.get("Label")
-
-    now = _utc_now_iso()
-    table = current_app.ddb_table
-
-    # 1) Create / overwrite active verification record for this buyer
-    # PK = USER#nnn, SK = VERIFY#USER#ACTIVE (fits your existing verify_decision logic)
-    verify_item = {
-        "PK": buyer_pk,
-        "SK": "VERIFY#USER#ACTIVE",
-
-        "Type": "VerifyUserLocation",
-        "Status": "pending",
-        "SubmittedAt": now,
-
-        # Data blob shown in /admin/verify/queue
-        "Data": {
-            "lat": Decimal(str(lat)),
-            "lon": Decimal(str(lon)),
-            "country": country,
-            "region": region,
-            "city": city,
-            "label": label,
-        },
-
-        # Put into verify queue GSI2 as "pending user" item
-        "GSI2PK": "VERIFY#PENDING#user",
-        "GSI2SK": now,
-    }
-
-    table.put_item(Item=verify_item)
-
-    # 2) Mark profile as "pending" (you already have IsVerified + VerifiedStatus)
-    table.update_item(
-        Key=_profile_key(buyer_pk),
-        UpdateExpression="SET IsVerified=:f, VerifiedStatus=:vs",
-        ExpressionAttributeValues={":f": False, ":vs": "pending"},
-    )
-
-    return jsonify({
-        "ok": True,
-        "user_pk": buyer_pk,
-        "location": {
-            "latitude": lat,
-            "longitude": lon,
-            "country": country,
-            "region": region,
-            "city": city,
-            "label": label,
-        },
-    }), 201
 
 @bp.post("/bids")
 @require_role("buyers", "admin")
@@ -363,6 +259,7 @@ def edit_bid():
       "buyerMax": 6000
     }
     """
+   
     buyer_pk = _buyer_pk_from_session()
     if not buyer_pk:
         return ("Unauthorized", 401)
@@ -410,6 +307,59 @@ def edit_bid():
     bid_price_decimal = Decimal(str(bid_price))
     buyer_min_decimal = Decimal(str(buyer_min)) if buyer_min is not None else None
     buyer_max_decimal = Decimal(str(buyer_max)) if buyer_max is not None else None
+
+    # --- platform range guard (fixed placement) ---
+    if not market_key:
+        return jsonify({"ok": False, "error": "Missing marketKey"}), 400
+
+    parts = market_key.split("#")
+    if len(parts) < 2:
+        return jsonify({"ok": False, "error": "Invalid marketKey format"}), 400
+
+    grade = parts[-1]
+    device_pk = "#".join(parts[:-1])  # keeps "Device#072" intact
+
+    # Load platform min and max from device profile
+    prof = table.get_item(Key={"PK": device_pk, "SK": "PROFILE"}).get("Item")
+    if not prof:
+        return jsonify({"ok": False, "error": "Market not found"}), 404
+
+    min_key = f"Grade_{grade}_MIN"
+    max_key = f"Grade_{grade}_MAX"
+    platform_min = prof.get(min_key)
+    platform_max = prof.get(max_key)
+
+    if platform_min is None or platform_max is None:
+        return jsonify({"ok": False, "error": f"Missing platform range for grade {grade}"}), 400
+
+    platform_min_d = Decimal(str(platform_min))
+    platform_max_d = Decimal(str(platform_max))
+
+    # Require buyer range for consistent band computation
+    if buyer_min_decimal is None or buyer_max_decimal is None:
+        return jsonify({"ok": False, "error": "buyerMin and buyerMax are required"}), 400
+    if buyer_min_decimal > buyer_max_decimal:
+        return jsonify({"ok": False, "error": "buyerMin cannot exceed buyerMax"}), 400
+
+    midpoint = (buyer_min_decimal + buyer_max_decimal) / Decimal("2")
+
+    # Must not be under platform minimum
+    if midpoint < platform_min_d:
+        return jsonify({"ok": False, "error": "Buyer range is below platform minimum"}), 400
+
+    # Final bid must be within platform range
+    if bid_price_decimal < platform_min_d or bid_price_decimal > platform_max_d:
+        return jsonify({"ok": False, "error": "Final bid must be within platform range"}), 400
+
+    # Band logic consistent with your bid wizard modal (0.8x to 1.2x, clamped)
+    band_low = max(bid_price_decimal * Decimal("0.8"), buyer_min_decimal, platform_min_d)
+    band_high = min(bid_price_decimal * Decimal("1.2"), buyer_max_decimal, platform_max_d)
+
+    if bid_price_decimal < band_low or bid_price_decimal > band_high:
+        return jsonify({"ok": False, "error": "Final bid must be within allowed band"}), 400
+
+    is_buyout = midpoint > platform_max_d
+    # --- end platform range guard ---
 
     update_expr_parts = [
         "BidPrice = :p",
@@ -1221,7 +1171,7 @@ import urllib.parse
 # ...
 
 @bp.get("/listings/<path:listing_id>")
-@require_role("buyers", "admin")
+@require_role("buyers","sellers", "admin")
 def get_listing_details(listing_id: str):
     """
     Return full details for a single listing for the buyer details page.

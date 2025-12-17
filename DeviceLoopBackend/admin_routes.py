@@ -57,7 +57,7 @@ def _list_by_role(table, role: str, limit: int, cursor: str | None):
     kwargs = {
         "IndexName": _gsi1(),
         "KeyConditionExpression": Key("GSI1PK").eq(f"ROLE#{role}"),
-        "FilterExpression": Attr("Status").ne("deleted"),
+        "FilterExpression": Attr("Status").ne("deleted") & Attr("PK").begins_with("USER#"),
         "Limit": limit,
     }
     lek = _decode_cursor(cursor)
@@ -150,14 +150,14 @@ def list_users():
 
     else:
         # Default: list ALL users (profile items), but ignore soft-deleted.
-        fe = (
-            Attr("SK").eq("PROFILE")
-            & Attr("Type").eq("User")
-            & Attr("Status").ne("deleted")
-        )
-        scan_kwargs = {"FilterExpression": fe, "Limit": limit}
-        lek = _decode_cursor(cursor)
-        if lek: scan_kwargs["ExclusiveStartKey"] = lek
+        scan_kwargs = {
+            "FilterExpression": Attr("SK").eq("PROFILE") & Attr("Status").ne("deleted"),
+            "Limit": limit,
+        }
+
+        if cursor:
+            scan_kwargs["ExclusiveStartKey"] = cursor
+
         resp = table.scan(**scan_kwargs)
         items = resp.get("Items", [])
         next_cursor = _encode_cursor(resp.get("LastEvaluatedKey"))
@@ -172,6 +172,10 @@ def list_users():
 
         sub = it.get("Sub")
         flags = _cognito_ver_flags(sub)
+
+        pk = it.get("PK", "")
+        if not pk.startswith("USER#"):
+            continue
 
         users.append({
             "user_pk": it["PK"],
@@ -594,3 +598,84 @@ def admin_decide_listing(listing_id: str):
         },
     )
     return jsonify(ok=True, decision="approve")
+
+
+@bp.get("/orders")
+@require_role("admin")
+def admin_list_orders():
+    """
+    Admin orders = all listings that have been matched to a buyer.
+    Payment is completed when PaymentStatus == "paid" and PaidAt exists.
+    Query params:
+      ?paymentStatus=all|pending|paid (default: all)
+    """
+    table = current_app.ddb_table
+    payment_status = (request.args.get("paymentStatus") or "all").lower()
+
+    filter_expr = (
+        Attr("SK").eq("LISTING_REQUEST")
+        & Attr("MatchedBuyerPK").exists()
+    )
+
+    if payment_status == "paid":
+        filter_expr = filter_expr & Attr("PaymentStatus").eq("paid")
+    elif payment_status == "pending":
+        filter_expr = filter_expr & (
+            Attr("PaymentStatus").ne("paid") | Attr("PaymentStatus").not_exists()
+        )
+
+    items = []
+    start_key = None
+    page_size = 250
+
+    while True:
+        scan_kwargs = {"FilterExpression": filter_expr, "Limit": page_size}
+        if start_key:
+            scan_kwargs["ExclusiveStartKey"] = start_key
+
+        resp = table.scan(**scan_kwargs)
+        items.extend(resp.get("Items", []))
+
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+
+    def _as_float(val) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+
+    orders = []
+    for it in items:
+        raw_trade_price = (
+            it.get("CurrentTradePrice")
+            or it.get("MatchedTradePrice")
+            or it.get("TradePrice")
+            or 0
+        )
+
+        paid = (it.get("PaymentStatus") == "paid")
+        orders.append({
+            "listingId": it.get("PK"),
+            "marketKey": it.get("MarketKey") or it.get("Market"),
+            "sellerPk": it.get("SellerPK"),
+            "buyerPk": it.get("MatchedBuyerPK"),
+            "brand": it.get("Brand"),
+            "model": it.get("Model"),
+            "variant": it.get("Variant"),
+            "grade": it.get("Grade"),
+            # you said you want only pending and paid:
+            "paymentStatus": "paid" if paid else "pending",
+            "paidAt": it.get("PaidAt"),
+            "tradePrice": _as_float(raw_trade_price),
+            "listingStatus": it.get("ListingStatus") or it.get("Status"),
+            "createdAt": it.get("CreatedAt"),
+            "updatedAt": it.get("UpdatedAt"),
+        })
+
+    def _sort_key(o: dict) -> str:
+        return o.get("paidAt") or o.get("updatedAt") or o.get("createdAt") or ""
+
+    orders.sort(key=_sort_key, reverse=True)
+    return jsonify({"ok": True, "items": orders})

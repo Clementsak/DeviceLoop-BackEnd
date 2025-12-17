@@ -113,7 +113,7 @@ def create_app():
         client_id=client_id,
         client_secret=client_secret,
         server_metadata_url=f"{issuer}/.well-known/openid-configuration",
-        client_kwargs={"scope": "openid email phone"},
+        client_kwargs={"scope": "openid email phone profile"},
     )
     app.oauth = oauth  # type: ignore[attr-defined]
 

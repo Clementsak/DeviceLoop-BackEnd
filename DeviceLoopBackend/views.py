@@ -100,12 +100,14 @@ def request_buyer_verification():
     body = request.get_json(force=True) or {}
     terms_accepted = bool(body.get("termsAccepted"))
     if not terms_accepted:
-        return jsonify(error="You must accept the terms and conditions"), 400
+        return jsonify(error="termsAccepted is required"), 400
 
     coords = body.get("coords") or {}
     lat = coords.get("lat")
     lon = coords.get("lon")
     accuracy = coords.get("accuracy")
+    if not isinstance(coords, dict) or coords.get("lat") is None or coords.get("lon") is None:
+        return jsonify(error="coords (lat/lon) is required"), 400
 
     # Optional: reverse geocode via Amazon Location Service
     place = None

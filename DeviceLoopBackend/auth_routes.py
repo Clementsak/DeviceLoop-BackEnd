@@ -15,6 +15,7 @@ GROUP_ORDER = ["admin", "sellers", "buyers"]
 client = boto3.client("dynamodb", region_name=os.getenv("AWS_REGION", "ap-southeast-1"))
 ser = TypeSerializer()
 
+
 def _cfg(name: str, default: str | None = None) -> str:
     v = current_app.config.get(name, default)
     if v is None:
@@ -69,6 +70,7 @@ def _next_user_seq(table):
 def _user_pk_from_num(n: int) -> str:
     return f"USER#{n:03d}"
 
+
 # Cognito helpers
 def _cognito_username_from_sub(sub: str) -> str | None:
     r = _idp().list_users(UserPoolId=_user_pool_id(), Filter=f'sub = "{sub}"', Limit=1)
@@ -94,6 +96,18 @@ def _ensure_group_membership(sub: str, group: str = DEFAULT_GROUP) -> None:
     except botocore.exceptions.ClientError as e:
         # harmless if group doesn't exist or already added; log if you like
         pass
+
+def _get_user_attribute_by_sub(sub: str, attr_name: str) -> str | None:
+    username = _cognito_username_from_sub(sub)
+    if not username:
+        return None
+
+    resp = _idp().admin_get_user(UserPoolId=_user_pool_id(), Username=username)
+    attrs = resp.get("UserAttributes", []) or []
+    for a in attrs:
+        if a.get("Name") == attr_name:
+            return a.get("Value")
+    return None
 
 #DynamoDB user profile sync
 def _find_user_pk_by_sub(table, sub: str) -> str | None:
@@ -186,11 +200,14 @@ def callback():
     sub   = user.get("sub")
     email = user.get("email")
     phone = user.get("phone_number")
+    # Try standard attribute first; fall back to a custom attribute if you used one
+    addr_str = _get_user_attribute_by_sub(sub, "address") or _get_user_attribute_by_sub(sub, "custom:address")
 
     session["user"] = {
         "sub": sub,
         "email": email,
         "phone_number": phone,
+        "address": addr_str,
     }
 
     table = current_app.ddb_table
@@ -199,6 +216,8 @@ def callback():
         _touch_last_login(table, user_pk)
     else:
         user_pk, _ = _create_first_time_user(table, sub, email, phone, )
+
+    session["userPk"] = user_pk
 
     _ensure_group_membership(sub, DEFAULT_GROUP)
     _sync_role_from_groups(table, user_pk, sub)
