@@ -15,6 +15,8 @@ def _allowed_origins() -> list[str]:
         "http://localhost:5173",
         "https://127.0.0.1:5173",
         "http://127.0.0.1:5173",
+        "https://deviceloop.online",
+        "https://www.deviceloop.online",
     ]
     extra = (os.getenv("FRONTEND_ORIGINS") or "").strip()
     if extra:
