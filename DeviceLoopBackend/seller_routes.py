@@ -539,11 +539,35 @@ def get_settings():
         return ("Unauthorized", 401)
 
     table = current_app.ddb_table
-    # Example: store settings under PROFILE item
-    resp = table.get_item(Key=_profile_key(seller_pk), ConsistentRead=True)
-    prof = resp.get("Item", {})
-    settings = prof.get("SellerSettings", {})  # nested doc
-    return jsonify(settings)
+
+    # Preferred source: seller registration details stored by /api/verify/seller
+    # PK = <user_pk>, SK = VERIFY#SELLER#ACTIVE, attribute SellerProfile
+    verify_resp = table.get_item(
+        Key={"PK": seller_pk, "SK": "VERIFY#SELLER#ACTIVE"},
+        ConsistentRead=True,
+    )
+    verify_item = verify_resp.get("Item") or {}
+    seller_profile = verify_item.get("SellerProfile") or {}
+
+    # Fallback: if you later copy seller settings into PROFILE, support that too.
+    if not seller_profile:
+        prof_resp = table.get_item(Key=_profile_key(seller_pk), ConsistentRead=True)
+        prof = prof_resp.get("Item") or {}
+        seller_profile = prof.get("SellerSettings") or prof.get("SellerProfile") or {}
+
+    out = {
+        "organisationName": seller_profile.get("organisationName"),
+        "organisationRegNo": seller_profile.get("organisationRegNo"),
+        "address": seller_profile.get("address"),
+        "contactEmail": seller_profile.get("contactEmail"),
+        "contactPhone": seller_profile.get("contactPhone"),
+        "website": seller_profile.get("website"),
+        "notes": seller_profile.get("notes"),
+        "submittedAt": seller_profile.get("submittedAt") or verify_item.get("SubmittedAt"),
+    }
+
+    return jsonify(out)
+
 
 @bp.put("/settings")
 @require_role("sellers", "admin")
@@ -633,3 +657,4 @@ def list_listing_requests():
         "requests": requests,
         "listings": listings,
     })
+

@@ -352,7 +352,48 @@ def verify_decision(user_pk: str):
         ExpressionAttributeValues=expr_vals,
     )
 
-    # 4) TODO (later): enqueue notifications to SQS/SES
+    if kind == "seller" and decision == "approve":
+        prof = table.get_item(Key=_profile_key(user_pk), ConsistentRead=True).get("Item") or {}
+        sub = prof.get("Sub")
+        if not sub:
+            return jsonify(error="Missing Sub on profile"), 400
+
+        username = _cognito_username_from_sub(sub)
+        if not username:
+            return jsonify(error="Amazon Cognito user not found"), 404
+
+        # Remove buyers group (safe if not present) and add sellers group
+        try:
+            _idp().admin_remove_user_from_group(
+                UserPoolId=_user_pool_id(),
+                Username=username,
+                GroupName="buyers",
+            )
+        except ClientError:
+            pass
+
+        try:
+            _idp().admin_add_user_to_group(
+                UserPoolId=_user_pool_id(),
+                Username=username,
+                GroupName="sellers",
+            )
+        except ClientError as e:
+            return jsonify(
+                error=f"Failed to add to sellers group: {e.response['Error']['Message']}"
+            ), 400
+
+        gr = _idp().admin_list_groups_for_user(
+            UserPoolId=_user_pool_id(),
+            Username=username,
+        ).get("Groups", [])
+        groups = sorted({
+            str(g.get("GroupName", "")).lower()
+            for g in gr
+            if isinstance(g, dict) and g.get("GroupName")
+        })
+
+        _sync_role_ddb(table, user_pk, "sellers", groups)
 
     return jsonify(ok=True, user_pk=user_pk, type=kind, decision=decision)
 

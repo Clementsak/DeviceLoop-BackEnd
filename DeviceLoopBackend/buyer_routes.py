@@ -449,7 +449,7 @@ def cancel_bid():
     return jsonify({"ok": True, "bidPk": bid_pk, "bidSk": bid_sk})
 
 @bp.get("/listings")
-@require_role("buyers", "admin")
+@require_role("buyers", "sellers", "admin")
 def browse_listings():
     """
     Public buyer view of active listings.
