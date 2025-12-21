@@ -4,6 +4,7 @@ import boto3
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from authlib.integrations.flask_client import OAuth
 
 load_dotenv()
@@ -11,10 +12,6 @@ load_dotenv()
 
 def _allowed_origins() -> list[str]:
     defaults = [
-        "https://localhost:5173",
-        "http://localhost:5173",
-        "https://127.0.0.1:5173",
-        "http://127.0.0.1:5173",
         "https://deviceloop.online",
         "https://www.deviceloop.online",
     ]
@@ -31,13 +28,29 @@ def _allowed_origins() -> list[str]:
 
 def create_app():
     app = Flask(__name__)
+    # Trust Nginx forwarded headers (scheme/host) so OAuth redirects use https://deviceloop.online
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
     app.url_map.strict_slashes = False
 
     # Secret key
-    app.secret_key = os.getenv(
-        "FLASK_SECRET_KEY",
-        "0481ee12a0cfbf8f9dff44073b5164adda000bd84b68657166b60eeba486a68b",
+    app.secret_key = os.getenv( "FLASK_SECRET_KEY", "0481ee12a0cfbf8f9dff44073b5164adda000bd84b68657166b60eeba486a68b",
     )
+    secret = os.getenv("FLASK_SECRET_KEY") or os.getenv("SECRET_KEY")
+    if not secret:
+        raise RuntimeError("Missing FLASK_SECRET_KEY (or SECRET_KEY) in environment")
+
+    app.secret_key = secret
+    app.config["SECRET_KEY"] = secret
+
+
+    cookie_domain = os.getenv("COOKIE_DOMAIN")  # example: .deviceloop.online
+    if cookie_domain:
+        app.config["SESSION_COOKIE_DOMAIN"] = cookie_domain
+
+    app.config["SESSION_COOKIE_SECURE"] = True
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "None"
 
     # Dynamo database
     aws_region = os.getenv("AWS_REGION", "ap-southeast-1")
@@ -51,13 +64,10 @@ def create_app():
         COGNITO_USERPOOL_ID=os.getenv("COGNITO_USERPOOL_ID"),
         COGNITO_CLIENT_ID=os.getenv("COGNITO_CLIENT_ID"),
         COGNITO_HOSTED_DOMAIN=os.getenv("COGNITO_HOSTED_DOMAIN"),
-        FRONTEND_AFTER_LOGIN=os.getenv("FRONTEND_AFTER_LOGIN", "https://localhost:5173/"),
-        FRONTEND_AFTER_LOGOUT=os.getenv("FRONTEND_AFTER_LOGOUT", "https://localhost:5173/"),
-        COGNITO_SIGNOUT_CALLBACK=os.getenv(
-            "COGNITO_SIGNOUT_CALLBACK",
-            "https://localhost:5000/auth/signout-callback",
-        ),
-        AWS_LOCATION_INDEX=os.getenv("AWS_LOCATION_INDEX", "deviceloop-place-index"),
+        FRONTEND_AFTER_LOGIN=os.getenv("FRONTEND_AFTER_LOGIN"),
+        FRONTEND_AFTER_LOGOUT=os.getenv("FRONTEND_AFTER_LOGOUT"),
+        COGNITO_SIGNOUT_CALLBACK=os.getenv("COGNITO_SIGNOUT_CALLBACK"),
+        AWS_LOCATION_INDEX=os.getenv("AWS_LOCATION_INDEX"),
         BIDS_QUEUE_URL=os.environ.get("BIDS_QUEUE_URL"),
         S3_UPLOADS_BUCKET=os.getenv("S3_UPLOADS_BUCKET"),
         S3_PRESIGN_EXPIRE=int(os.getenv("S3_PRESIGN_EXPIRE", "900")),

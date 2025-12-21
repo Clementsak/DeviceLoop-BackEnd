@@ -1,12 +1,12 @@
 ﻿# auth_routes.py
 import os
 from urllib.parse import quote
-from flask import Blueprint, current_app, redirect, session, url_for
+from flask import Blueprint, current_app, redirect, session, url_for, request
 from datetime import datetime, timezone
 import botocore
 import boto3
 from boto3.dynamodb.types import TypeSerializer
-
+from authlib.integrations.base_client.errors import MismatchingStateError
 
 bp = Blueprint("auth", __name__)
 
@@ -15,6 +15,14 @@ GROUP_ORDER = ["admin", "sellers", "buyers"]
 client = boto3.client("dynamodb", region_name=os.getenv("AWS_REGION", "ap-southeast-1"))
 ser = TypeSerializer()
 
+def _external_base_url() -> str:
+    """
+    Build the public base URL (scheme + host) when behind Nginx.
+    Uses forwarded headers if present; otherwise falls back to Flask values.
+    """
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    return f"{proto}://{host}"
 
 def _cfg(name: str, default: str | None = None) -> str:
     v = current_app.config.get(name, default)
@@ -69,7 +77,6 @@ def _next_user_seq(table):
 
 def _user_pk_from_num(n: int) -> str:
     return f"USER#{n:03d}"
-
 
 # Cognito helpers
 def _cognito_username_from_sub(sub: str) -> str | None:
@@ -184,17 +191,22 @@ def _sync_role_from_groups(table, user_pk: str, sub: str):
 #Route handlers
 @bp.get("/login")
 def login():
-    redirect_uri = url_for("auth.callback", _external=True, _scheme="https")
+    redirect_uri = f"{_external_base_url()}/api/auth/callback"
     return current_app.oauth.oidc.authorize_redirect(redirect_uri, prompt="login")
 
 @bp.get("/signup")
 def signup():
-    redirect_uri = url_for("auth.callback", _external=True, _scheme="https")
+    redirect_uri = f"{_external_base_url()}/api/auth/callback"
     return current_app.oauth.oidc.authorize_redirect(redirect_uri, screen_hint="signup")
 
 @bp.get("/callback")
 def callback():
-    token = current_app.oauth.oidc.authorize_access_token()
+    try:
+        token = current_app.oauth.oidc.authorize_access_token()
+    except MismatchingStateError:
+        current_app.logger.warning("Open Authorization 2.0 state mismatch. Clearing session and restarting login.")
+        session.clear()
+        return redirect("/api/auth/login")
     user  = token.get("userinfo") or {}
 
     sub   = user.get("sub")
@@ -209,7 +221,7 @@ def callback():
         "phone_number": phone,
         "address": addr_str,
     }
-
+    
     table = current_app.ddb_table
     user_pk = _find_user_pk_by_sub(table, sub)
     if user_pk:
@@ -243,7 +255,6 @@ def logout():
 
 @bp.get("/signout-callback")
 def signout_callback():
-    """Final hop after Cognito logout — back to frontend."""
-    return redirect(_cfg("FRONTEND_AFTER_LOGIN", "https://localhost:5173/"))
-
-
+    """Cognito redirects here after logout_uri; clear local session and redirect to frontend."""
+    session.clear()
+    return redirect(_cfg("FRONTEND_AFTER_LOGOUT", _cfg("FRONTEND_AFTER_LOGIN", "https://localhost:5173/")))

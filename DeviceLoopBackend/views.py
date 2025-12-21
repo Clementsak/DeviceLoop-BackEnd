@@ -109,7 +109,7 @@ def request_buyer_verification():
     if not isinstance(coords, dict) or coords.get("lat") is None or coords.get("lon") is None:
         return jsonify(error="coords (lat/lon) is required"), 400
 
-    # Optional: reverse geocode via Amazon Location Service
+    # reverse geocode via Amazon Location Service
     place = None
     if lat is not None and lon is not None:
         try:
