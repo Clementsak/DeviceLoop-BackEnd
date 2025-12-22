@@ -3,8 +3,17 @@ os: linux
 file_exists_behavior: OVERWRITE
 
 files:
-  - source: /
+  - source: DeviceLoopBackend
+    destination: /opt/deviceloop-backend/DeviceLoopBackend
+
+  - source: requirements.txt
     destination: /opt/deviceloop-backend
+
+  - source: runserver.py
+    destination: /opt/deviceloop-backend
+
+  - source: scripts
+    destination: /opt/deviceloop-backend/scripts
 
 hooks:
   BeforeInstall:
