@@ -125,7 +125,7 @@ def request_buyer_verification():
             results = resp.get("Results") or []
             if results:
                 raw_place = results[0].get("Place", {})
-                # Only keep simple string fields – no floats, no Geometry
+                # Only keep simple string fields ï¿½ no floats, no Geometry
                 place = {
                     "label": raw_place.get("Label"),
                     "country": raw_place.get("Country"),
