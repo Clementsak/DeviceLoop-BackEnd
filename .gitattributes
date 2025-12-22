@@ -1,0 +1,2 @@
+*.sh text eol=lf
+appspec.yml text eol=lf
