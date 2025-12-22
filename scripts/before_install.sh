@@ -1,12 +1,18 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# Make sure scripts are executable (helps if Git did not preserve permissions)
-chmod -R +x /opt/codedeploy-agent/deployment-root/*/deployment-archive/scripts 2>/dev/null || true
+APP_DIR="/opt/deviceloop-backend"
+TMP_DIR="/tmp/deviceloop-backend"
+ENV_FILE="${APP_DIR}/.env"
 
-# Stop service if it exists
+echo "[BeforeInstall] Stopping service if it exists..."
 systemctl stop deviceloop-backend || true
 
-# Ensure destination exists
-mkdir -p /opt/deviceloop-backend
-chown -R ubuntu:ubuntu /opt/deviceloop-backend || true
+echo "[BeforeInstall] Preserving instance .env (if present)..."
+mkdir -p "${TMP_DIR}"
+if [ -f "${ENV_FILE}" ]; then
+  cp "${ENV_FILE}" "${TMP_DIR}/.env"
+fi
+
+echo "[BeforeInstall] Ensuring application directory exists..."
+mkdir -p "${APP_DIR}"

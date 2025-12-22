@@ -1,6 +1,6 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
+echo "[ApplicationStart] Reloading systemd and starting service..."
 systemctl daemon-reload
 systemctl restart deviceloop-backend
-systemctl enable deviceloop-backend

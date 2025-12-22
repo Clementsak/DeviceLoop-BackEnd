@@ -1,8 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# Confirm service is running
+echo "[ValidateService] Checking service status..."
+sleep 2
 systemctl is-active --quiet deviceloop-backend
 
-# Show last logs (useful in CodeDeploy console output)
-journalctl -u deviceloop-backend --no-pager -n 50
+echo "[ValidateService] Service is running."

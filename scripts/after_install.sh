@@ -1,23 +1,26 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-cd /opt/deviceloop-backend
+APP_DIR="/opt/deviceloop-backend"
+TMP_DIR="/tmp/deviceloop-backend"
+VENV_DIR="${APP_DIR}/venv"
 
-# Ensure required packages exist
+echo "[AfterInstall] Installing operating system dependencies..."
 apt-get update -y
-apt-get install -y python3-pip python3-venv
+apt-get install -y python3-venv python3-pip
 
-# Create or reuse a virtual environment (recommended)
-if [ ! -d "/opt/deviceloop-backend/venv" ]; then
-  python3 -m venv /opt/deviceloop-backend/venv
+echo "[AfterInstall] Creating virtual environment..."
+python3 -m venv "${VENV_DIR}"
+
+echo "[AfterInstall] Installing Python dependencies..."
+"${VENV_DIR}/bin/pip" install --upgrade pip
+"${VENV_DIR}/bin/pip" install -r "${APP_DIR}/requirements.txt"
+
+echo "[AfterInstall] Restoring instance .env (if it exists)..."
+if [ -f "${TMP_DIR}/.env" ]; then
+  cp "${TMP_DIR}/.env" "${APP_DIR}/.env"
 fi
 
-source /opt/deviceloop-backend/venv/bin/activate
-
-python -m pip install --upgrade pip
-
-if [ -f "requirements.txt" ]; then
-  pip install -r requirements.txt
-fi
-
-chown -R ubuntu:ubuntu /opt/deviceloop-backend || true
+echo "[AfterInstall] Setting permissions..."
+chown -R ubuntu:ubuntu "${APP_DIR}" || true
+chmod -R u+rwX,go-rwx "${APP_DIR}" || true
