@@ -1,14 +1,32 @@
-﻿# Ignore Visual Studio
+﻿# Visual Studio
 .vs/
+*.user
+*.suo
+
+# Visual Studio Code
+.vscode/
 
 # Python cache
 __pycache__/
-*.pyc
+*.py[cod]
 
 # Virtual environments
 .venv/
-env/
 venv/
+env/
 
-# Other unnecessary files
+# Environment / secrets
+.env
+*.env
+
+# Logs
 *.log
+
+# Linux / nano / vim swap files
+*.swp
+*.swo
+*~
+
+# Certificates / private keys (keep public certs if you want)
+*.pem
+*.key
