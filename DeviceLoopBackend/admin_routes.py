@@ -12,7 +12,8 @@ from .auth_routes import (
     _find_user_pk_by_sub,  # already have
     _cognito_username_from_sub,
     role_from_groups,
-    _profile_key
+    _profile_key,
+    _sub_map_key,
 )
 
 def _table():
@@ -251,22 +252,98 @@ def change_role(user_pk: str):
     return jsonify(ok=True, user_pk=user_pk, role=new_role, groups=groups)
 
 
-@bp.delete("/users/<user_pk>")
+@bp.route("/users/<path:user_pk>", methods=["DELETE"])
 @require_role("admin")
-def delete_user(user_pk: str):
-    hard = request.args.get("hard") == "true"
+def delete_user(user_pk):
+    """
+    Default behaviour is now HARD delete:
+    1) Delete user in Amazon Cognito (frees email in the user pool)
+    2) Delete user profile + sub map in Amazon DynamoDB (removes from admin lists and role lookups)
+
+    If you ever need the old behaviour, call:
+      DELETE /admin/users/<userPk>?hard=false
+    """
+    # default hard delete unless explicitly disabled
+    hard_arg = request.args.get("hard")
+    hard_delete = True if hard_arg is None else (hard_arg.lower() == "true")
+
     table = current_app.ddb_table
-    if hard:
-        table.delete_item(Key=_profile_key(user_pk))
-        # optionally also delete SUB# map if you keep it: {"PK": f"SUB#{sub}", "SK":"MAP"}
-    else:
-        table.update_item(
-            Key=_profile_key(user_pk),
-            UpdateExpression="SET #s=:d REMOVE GSI1PK, GSI1SK, GSI3PK, GSI3SK",
-            ExpressionAttributeNames={"#s": "Status"},
-            ExpressionAttributeValues={":d": "deleted"},
-        )
-    return jsonify(ok=True, user_pk=user_pk, hard=hard)
+    profile_key = _profile_key(user_pk)
+
+    profile = table.get_item(Key=profile_key).get("Item")
+
+    if hard_delete:
+        # --- 1) Delete from Amazon Cognito ---
+        # Try to discover the Amazon Cognito Username reliably (sub -> Username, fallback email)
+        sub_value = None
+        email_value = None
+        if profile:
+            sub_value = profile.get("Sub") or profile.get("sub")
+            email_value = profile.get("Email") or profile.get("email")
+
+        cognito_username = None
+        if sub_value:
+            cognito_username = _cognito_username_from_sub(sub_value)
+        if not cognito_username and email_value:
+            # fallback: search by email in Amazon Cognito
+            try:
+                resp = _idp.list_users(
+                    UserPoolId=_user_pool_id,
+                    Filter=f'email = "{email_value}"',
+                    Limit=1,
+                )
+                users = resp.get("Users", [])
+                if users:
+                    cognito_username = users[0].get("Username")
+            except Exception:
+                cognito_username = cognito_username  # keep whatever we have
+
+        # last resort: some pools use email directly as Username
+        if not cognito_username and email_value:
+            cognito_username = email_value
+
+        if cognito_username:
+            try:
+                _idp.admin_delete_user(
+                    UserPoolId=_user_pool_id,
+                    Username=cognito_username,
+                )
+            except _idp.exceptions.UserNotFoundException:
+                pass  # already gone from Amazon Cognito
+            except Exception as e:
+                # Do not block Amazon DynamoDB cleanup if Amazon Cognito deletion fails
+                print(f"[admin_delete_user] failed for {user_pk}: {e}")
+
+        # --- 2) Delete from Amazon DynamoDB ---
+        # delete sub map if present (used by _find_user_pk_by_sub)
+        if sub_value:
+            try:
+                table.delete_item(Key=_sub_map_key(sub_value))
+            except Exception as e:
+                print(f"[delete_sub_map] failed for {user_pk}: {e}")
+
+        # delete the profile row (removes from admin lists)
+        if profile:
+            table.delete_item(Key=profile_key)
+
+        return jsonify({"ok": True, "hard": True})
+
+    # ---- Soft delete (kept for completeness) ----
+    if not profile:
+        return jsonify({"ok": True, "hard": False, "note": "profile not found"})
+
+    expr = "SET #S = :deleted, DeletedAt = :ts REMOVE GSI1PK, GSI1SK, GSI3PK, GSI3SK"
+    table.update_item(
+        Key=profile_key,
+        UpdateExpression=expr,
+        ExpressionAttributeNames={"#S": "Status"},
+        ExpressionAttributeValues={
+            ":deleted": "deleted",
+            ":ts": _iso_now(),
+        },
+    )
+    return jsonify({"ok": True, "hard": False})
+
 
 
 @bp.get("/verify/queue")
