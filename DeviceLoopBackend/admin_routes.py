@@ -287,14 +287,17 @@ def delete_user(user_pk):
         if not cognito_username and email_value:
             # fallback: search by email in Amazon Cognito
             try:
-                resp = _idp.list_users(
-                    UserPoolId=_user_pool_id,
-                    Filter=f'email = "{email_value}"',
-                    Limit=1,
+                idp = _idp()
+                pool_id = _user_pool_id()
+
+                resp = idp.list_users(
+                    UserPoolId=pool_id,
+                    Filter=f'sub = "{sub}"',
+                    Limit=1
                 )
                 users = resp.get("Users", [])
                 if users:
-                    cognito_username = users[0].get("Username")
+                    sub = users[0]["Username"]
             except Exception:
                 cognito_username = cognito_username  # keep whatever we have
 
