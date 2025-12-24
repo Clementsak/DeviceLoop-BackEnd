@@ -288,31 +288,46 @@ def delete_user(user_pk):
             # fallback: search by email in Amazon Cognito
             try:
                 idp = _idp()
-                pool_id = _user_pool_id()
 
-                resp = idp.list_users(
-                    UserPoolId=pool_id,
-                    Filter=f'sub = "{sub}"',
-                    Limit=1
-                )
-                users = resp.get("Users", [])
-                if users:
-                    sub = users[0]["Username"]
-            except Exception:
-                cognito_username = cognito_username  # keep whatever we have
+                if sub_value and not cognito_username:
+                    try:
+                        resp = idp.list_users(
+                            UserPoolId=_user_pool_id(),
+                            Filter=f'sub = "{sub_value}"',
+                            Limit=1
+                        )
+                        users = resp.get("Users", [])
+                        if users:
+                            cognito_username = users[0]["Username"]
+                    except Exception:
+                        pass
 
-        # last resort: some pools use email directly as Username
-        if not cognito_username and email_value:
-            cognito_username = email_value
+                # optional fallback lookup by email:
+                if email_value and not cognito_username:
+                    try:
+                        resp = idp.list_users(
+                            UserPoolId=_user_pool_id(),
+                            Filter=f'email = "{email_value}"',
+                            Limit=1
+                        )
+                        users = resp.get("Users", [])
+                        if users:
+                            cognito_username = users[0]["Username"]
+                    except Exception:
+                        pass
 
-        if cognito_username:
-            try:
-                _idp.admin_delete_user(
-                    UserPoolId=_user_pool_id,
-                    Username=cognito_username,
-                )
-            except _idp.exceptions.UserNotFoundException:
-                pass  # already gone from Amazon Cognito
+                if cognito_username:
+                    try:
+                        idp.admin_delete_user(
+                            UserPoolId=_user_pool_id(),   # ? call the function
+                            Username=cognito_username,
+                        )
+                    except ClientError as e:
+                        # ? avoid relying on idp.exceptions (and avoids your crash)
+                        code = e.response.get("Error", {}).get("Code")
+                        if code != "UserNotFoundException":
+                            print(f"[admin_delete_user] failed for {user_pk}: {e}")
+
             except Exception as e:
                 # Do not block Amazon DynamoDB cleanup if Amazon Cognito deletion fails
                 print(f"[admin_delete_user] failed for {user_pk}: {e}")
