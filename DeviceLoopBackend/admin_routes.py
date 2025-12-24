@@ -273,15 +273,14 @@ def delete_user(user_pk):
     profile = table.get_item(Key=profile_key).get("Item")
 
     if hard_delete:
-        # --- 1) Delete from Amazon Cognito ---
-        # Try to discover the Amazon Cognito Username reliably (sub -> Username, fallback email)
-        sub_value = None
-        email_value = None
-        if profile:
-            sub_value = profile.get("Sub") or profile.get("sub")
-            email_value = profile.get("Email") or profile.get("email")
+        table = current_app.ddb_table
+        profile_key = _profile_key(user_pk)
+        profile = table.get_item(Key=profile_key).get("Item")
 
-        # --- 1) Delete from Amazon Cognito ---
+        # Allow manual delete even if profile is missing (useful if DynamoDB record was deleted earlier)
+        q_username = request.args.get("username")
+        q_email = request.args.get("email")
+
         sub_value = None
         email_value = None
         if profile:
@@ -289,71 +288,89 @@ def delete_user(user_pk):
             email_value = profile.get("Email") or profile.get("email")
 
         idp = _idp()
-
-        # Try to discover the Amazon Cognito Username
+        cognito_deleted = False
         cognito_username = None
 
-        # If you already have a helper, keep it, but do NOT stop there
-        if sub_value:
-            cognito_username = _cognito_username_from_sub(sub_value)
+        # 0) If admin passes username/email explicitly, prefer that
+        if q_username:
+            cognito_username = q_username
+        else:
+            # 1) Try by sub (most reliable if you have it)
+            if sub_value:
+                try:
+                    resp = idp.list_users(
+                        UserPoolId=_user_pool_id(),
+                        Filter=f'sub = "{sub_value}"',
+                        Limit=1,
+                    )
+                    users = resp.get("Users", [])
+                    if users:
+                        cognito_username = users[0]["Username"]
+                except Exception:
+                    pass
 
-        # Fallback: lookup by sub in Amazon Cognito (this is the most reliable)
-        if sub_value and not cognito_username:
-            try:
-                resp = idp.list_users(
-                    UserPoolId=_user_pool_id(),
-                    Filter=f'sub = "{sub_value}"',
-                    Limit=1,
-                )
-                users = resp.get("Users", [])
-                if users:
-                    cognito_username = users[0]["Username"]
-            except Exception:
-                pass
+            # 2) Try by email if still not found
+            if not cognito_username and (q_email or email_value):
+                email_to_find = q_email or email_value
+                try:
+                    resp = idp.list_users(
+                        UserPoolId=_user_pool_id(),
+                        Filter=f'email = "{email_to_find}"',
+                        Limit=1,
+                    )
+                    users = resp.get("Users", [])
+                    if users:
+                        cognito_username = users[0]["Username"]
+                except Exception:
+                    pass
 
-        # Optional fallback: lookup by email in Amazon Cognito
-        if email_value and not cognito_username:
-            try:
-                resp = idp.list_users(
-                    UserPoolId=_user_pool_id(),
-                    Filter=f'email = "{email_value}"',
-                    Limit=1,
-                )
-                users = resp.get("Users", [])
-                if users:
-                    cognito_username = users[0]["Username"]
-            except Exception:
-                pass
+            # 3) Last resort: some pools use email as Username
+            if not cognito_username and (q_email or email_value):
+                cognito_username = q_email or email_value
 
-        # Last resort: some user pools use email as Username
-        if not cognito_username and email_value:
-            cognito_username = email_value
-
-        # Now actually delete from Amazon Cognito if we have a Username
+        # --- A) Delete from Amazon Cognito ---
         if cognito_username:
             try:
                 idp.admin_delete_user(
                     UserPoolId=_user_pool_id(),
                     Username=cognito_username,
                 )
+                cognito_deleted = True
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code")
-                if code != "UserNotFoundException":
-                    print(f"[admin_delete_user] failed for {user_pk}: {e}")
+                # If already gone, treat as deleted
+                if code == "UserNotFoundException":
+                    cognito_deleted = True
+                else:
+                    print(f"[admin_delete_user] failed for {user_pk} ({cognito_username}): {e}")
 
-        # --- 2) Delete from Amazon DynamoDB ---
-        # delete sub map if present (used by _find_user_pk_by_sub)
+        # --- B) Soft delete in Amazon DynamoDB (keep history/listings, remove from indexes) ---
+        if profile:
+            expr = "SET #S = :deleted, DeletedAt = :ts REMOVE GSI1PK, GSI1SK, GSI3PK, GSI3SK"
+            table.update_item(
+                Key=profile_key,
+                UpdateExpression=expr,
+                ExpressionAttributeNames={"#S": "Status"},
+                ExpressionAttributeValues={
+                    ":deleted": "deleted",
+                    ":ts": _iso_now(),
+                },
+            )
+
+        # --- C) Remove sub map so old tokens cannot map to a user anymore ---
         if sub_value:
             try:
                 table.delete_item(Key=_sub_map_key(sub_value))
             except Exception as e:
                 print(f"[delete_sub_map] failed for {user_pk}: {e}")
 
-        # delete the profile row (removes from admin lists)
-        if profile:
-            table.delete_item(Key=profile_key)
-
-        return jsonify({"ok": True, "hard": True})
+        return jsonify({
+            "ok": True,
+            "hard": True,
+            "cognitoDeleted": cognito_deleted,
+            "cognitoUsernameUsed": cognito_username,
+            "note": "DynamoDB profile soft-deleted; Cognito attempted delete."
+        })
 
     # ---- Soft delete (kept for completeness) ----
     if not profile:
