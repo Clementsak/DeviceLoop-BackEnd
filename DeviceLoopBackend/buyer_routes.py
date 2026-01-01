@@ -1471,6 +1471,17 @@ def pay_for_purchase(listing_id: str):
             ConditionExpression=Attr("MatchedBuyerPK").eq(buyer_pk)
             & (Attr("PaymentStatus").ne("paid") | Attr("PaymentStatus").not_exists()),
         )
+        # 1b) Mark trade record as paid too (keep TRADE item consistent with listing)
+        table.update_item(
+            Key={"PK": listing_pk, "SK": "TRADE"},
+            UpdateExpression="SET PaymentStatus = :paid, PaidAt = :paidAt",
+            ExpressionAttributeValues={
+                ":paid": "paid",
+                ":paidAt": paid_at_iso,
+            },
+            ConditionExpression=Attr("BuyerPK").eq(buyer_pk)
+            & (Attr("PaymentStatus").ne("paid") | Attr("PaymentStatus").not_exists()),
+        )
 
         # 2) Reload listing to include all metadata for the response + notifications
         listing_resp = table.get_item(Key={"PK": listing_pk, "SK": listing_sk})

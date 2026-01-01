@@ -75,6 +75,7 @@ def create_app():
         SESSION_COOKIE_SAMESITE="None",
         SESSION_COOKIE_SECURE=True,
         PREFERRED_URL_SCHEME="https",
+        SESSION_COOKIE_HTTPONLY=True,
     )
 
     allowed = _allowed_origins()
