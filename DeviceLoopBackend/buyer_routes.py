@@ -1474,7 +1474,7 @@ def pay_for_purchase(listing_id: str):
         # 1b) Mark trade record as paid too (keep TRADE item consistent with listing)
         table.update_item(
             Key={"PK": listing_pk, "SK": "TRADE"},
-            UpdateExpression="SET SettlementStatus = :paid, PaidAt = :paidAt",
+            UpdateExpression="SET SettlementStatus = :paid, SettlementUpdatedAt = :paidAt",
             ExpressionAttributeValues={
                 ":paid": "paid",
                 ":paidAt": paid_at_iso,
