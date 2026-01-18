@@ -91,34 +91,26 @@ def _user_pk_from_session() -> str | None:
     table = current_app.ddb_table
     return _find_user_pk_by_sub(table, u["sub"])
 
+def _load_device_catalog_record(device_pk: str) -> dict:
+    table = current_app.ddb_table
+    candidate_sks = [
+        "PRICE", "PRICES", "DEVICE", "CATALOG", "META", "DETAILS", "ITEM", "PROFILE"
+    ]
+
+    for sk in candidate_sks:
+        try:
+            resp = table.get_item(Key={"PK": device_pk, "SK": sk})
+            item = resp.get("Item")
+            if item:
+                return item
+        except Exception:
+            pass
+
+    return {}
+
 @bp.post("/bids")
 @require_role("buyers", "admin")
 def submit_bid():
-    """
-    Create a *market-level* bid for a given device + grade.
-
-    This is called by the BidWizardModal.
-
-    Expected JSON body (from the wizard):
-
-      {
-        "devicePk": "DEVICE#083A",
-        "grade": "A",
-        "mode": "interval" | "end_of_window" | "continuous",
-        "buyerMin": 6200.0,
-        "buyerMax": 6500.0,
-        "finalBid": 6300.0,
-        "bandLow": 6200.0,
-        "bandHigh": 6300.0,
-        "isBuyout": true | false
-      }
-
-    Notes:
-      * We do NOT tie the bid to a specific listing anymore.
-      * We still send a NEW_BID message to SQS so your existing
-        deviceloop-bids-matcher / deviceloop-bids-clearing Lambdas
-        keep working with the same message shape.
-    """
     buyer_pk = _buyer_pk_from_session()
     if not buyer_pk:
         return ("Unauthorized", 401)
@@ -1022,7 +1014,7 @@ def get_my_bids():
         return ("Unauthorized", 401)
 
     table = current_app.ddb_table
-
+    
     # --------- 1) Scan for this buyer's bids ---------
     from boto3.dynamodb.conditions import Attr
 
@@ -1066,18 +1058,12 @@ def get_my_bids():
             current_app.logger.warning("Failed to load listing %s: %s", pk, e)
 
     # Collect unique DevicePKs from listings
-    device_pks = {
-        it.get("DevicePK")
-        for it in listings_by_pk.values()
-        if it.get("DevicePK")
-    }
+    device_pks = {it.get("DevicePK") for it in bid_items if it.get("DevicePK")}
+
     devices_by_pk: dict[str, dict] = {}
     for dpk in device_pks:
         try:
-            resp = table.get_item(Key={"PK": dpk, "SK": "PROFILE"})
-            item = resp.get("Item")
-            if item:
-                devices_by_pk[dpk] = item
+            devices_by_pk[dpk] = _load_device_catalog_record(dpk)
         except Exception as e:
             current_app.logger.warning("Failed to load device %s: %s", dpk, e)
 
@@ -1090,27 +1076,31 @@ def get_my_bids():
         listing_pk = it.get("ListingPK")
 
         listing = listings_by_pk.get(listing_pk or "", {})
-        device_pk = listing.get("DevicePK")
+        device_pk = it.get("DevicePK")
         device = devices_by_pk.get(device_pk or "", {})
 
         # Device label
-        brand = device.get("Brand") or device.get("brand") or ""
-        model = device.get("Model") or device.get("model") or ""
-        storage = device.get("Storage") or device.get("storage") or ""
-        ram = device.get("RAM") or device.get("ram") or ""
+        label = (
+            device.get("Device")
+            or device.get("device")
+            or device.get("deviceName")
+            or device.get("name")
+            or ""
+        ).strip()
+        if not label:
+            brand = device.get("Brand") or device.get("brand") or ""
+            model = device.get("Model") or device.get("model") or ""
+            storage = device.get("Storage") or device.get("storage") or ""
+            ram = device.get("RAM") or device.get("ram") or ""
 
-        label = (brand + " " + model).strip() or (market_key or "Unknown device")
-        if storage or ram:
-            extra = " / ".join([x for x in [storage, ram] if x])
-            if extra:
-                label = f"{label} ({extra})"
+            label = (brand + " " + model).strip() or (market_key or "Unknown device")
+            if storage or ram:
+                extra = " / ".join([x for x in [storage, ram] if x])
+                if extra:
+                    label = f"{label} ({extra})"
 
         # Grade
-        grade = (
-            listing.get("FinalGrade")
-            or listing.get("InitialGrade")
-            or None
-        )
+        grade = it.get("Grade") or None
         if not grade and market_key:
             parts = str(market_key).split("#")
             if len(parts) >= 3:

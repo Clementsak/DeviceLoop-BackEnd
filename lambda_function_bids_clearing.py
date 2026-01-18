@@ -481,14 +481,24 @@ def run_double_auction_for_market(
 
     priced_bids: list[tuple[float, dict]] = []
     for bid in bids:
-        bp = (
-            _num(bid.get("FinalBidPrice"))
-            or _num(bid.get("BuyerMax"))
-            or _num(bid.get("BidPrice"))
-        )
+        bp = _num(bid.get("BidPrice"))
+
+        # Strict rule: interval and end-of-window matching uses only the final bid price.
+        # If final bid price is missing or not numeric, the bid is ignored for clearing.
         if bp is None:
+            logger.info(
+                "[CLEARING] Skipping bid because FinalBidPrice is missing or not numeric. "
+                "bidPk=%s bidSk=%s BidPrice=%r BuyerMax=%r FinalBidPrice=%r",
+                bid.get("PK"),
+                bid.get("SK"),
+                bid.get("BidPrice"),
+                bid.get("BuyerMax"),
+                bid.get("FinalBidPrice"),
+            )
             continue
+
         priced_bids.append((bp, bid))
+
 
     # If no valid prices or no bids -> treat as no match and expire asks (this is needed for end_of_window final run)
     if not priced_asks or not priced_bids:

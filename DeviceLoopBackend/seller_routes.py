@@ -105,35 +105,6 @@ def seller_summary():
 @bp.post("/listing-requests")
 @require_role("sellers", "admin")
 def create_listing_request():
-    """
-    Create a new listing request for the selected catalogue device.
-
-    Request JSON (what the React modal sends):
-
-    {
-      "device": { "pk": "Device#088" },
-      "photos": {
-        "front":  "listings/....-front.jpg",
-        "back":   "listings/....-back.jpg",
-        "left":   "listings/....-left.jpg",
-        "right":  "listings/....-right.jpg",
-        "top":    "listings/....-top.jpg",
-        "bottom": "listings/....-bottom.jpg",
-        "imei":   "listings/....-imei.jpg"
-      },
-      "questionnaire": {
-        "freeOfLocks": true,
-        "canPowerOn": true,
-        "screenCondition": "Flawless",
-        "bodyCondition": "Flawless",
-        "biometric": "yes",
-        "cameras": "front_issue",
-        "coreFunctions": "ok",
-        "seriousIssues": []
-      }
-    }
-    """
-
     data = request.get_json(force=True) or {}
 
     device_info = data.get("device") or {}

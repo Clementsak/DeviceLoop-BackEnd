@@ -35,40 +35,7 @@ def compute_initial_grade_and_range(
     device: Dict[str, Any],
     questionnaire: Dict[str, Any],
 ) -> tuple[str, float, float]:
-    """
-    Decide initial grade (A/B/C) and price range based on questionnaire
-    answers and the platform pricing in the device PROFILE row.
-
-    device: a DynamoDB item, for example:
-        {
-          "PK": "Device#088",
-          "SK": "PROFILE",
-          "Brand": "Samsung",
-          "Category": "Tablet",
-          "Model": "Galaxy Tab S9",
-          "RAM": "8GB",
-          "Storage": "256GB",
-          "Grade_A_MIN": 4400,
-          "Grade_A_MAX": 4100,
-          "Grade_B_MIN": 3800,
-          "Grade_B_MAX": 3500,
-          "Grade_C_MIN": 3200,
-          "Grade_C_MAX": 2900,
-          ...
-        }
-
-    questionnaire: what the front-end sends under `questionnaire`, for example:
-        {
-          "freeOfLocks": true,
-          "canPowerOn": true,
-          "screenCondition": "Flawless",
-          "bodyCondition": "Flawless",
-          "biometric": "yes",
-          "coreFunctions": "ok",
-          "cameras": "front_issue",
-          "seriousIssues": []
-        }
-    """
+    
 
     # ---- 1) Hard rejections -------------------------------------------------
     free_of_locks = bool(questionnaire.get("freeOfLocks", False))
