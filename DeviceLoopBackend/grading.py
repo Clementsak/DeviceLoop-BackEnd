@@ -61,7 +61,7 @@ def compute_initial_grade_and_range(
     downgrade = 0  # 0 = A, 1 = B, 2 = C
 
     def minor(txt: str) -> bool:
-        return any(w in txt for w in ["2-3 minor", "2-3 minor", "some minor", "some issues"])
+        return any(w in txt for w in ["minor scratches"])
 
     def heavy(txt: str) -> bool:
         return any(w in txt for w in ["heavy", "cracked", "dented", "major"])
