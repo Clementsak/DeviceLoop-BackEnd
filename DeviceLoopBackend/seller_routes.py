@@ -75,6 +75,11 @@ def seller_summary():
         & (Attr("Status").eq("unverified") | Attr("Status").eq("pending"))
     )
 
+    pending_listings = scan_count(
+        base_listing_filter & Attr("Status").eq("verified")
+    )
+
+
     # Pending payments = matched listings that are not paid yet
     # (matches your /seller/orders logic: MatchedBuyerPK exists + PaymentStatus not paid)
     orders_pending = scan_count(
@@ -95,6 +100,7 @@ def seller_summary():
             "listings_active": int(active_count),
             "orders_pending": int(orders_pending),
             "requests_pending": int(pending_requests),
+            "listings_pending": int(pending_listings),
             "messages_unread": int(messages_unread),
             "next_payout": None,
             "generated_at": datetime.now(timezone.utc).isoformat(),
